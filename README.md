@@ -8,6 +8,8 @@ Faster fwd & bwd CUDA kernels: https://github.com/BlinkDL/RWKV-CUDA/tree/main/rw
 
 Faster sampling: https://github.com/Triang-jyed-driung/Rapid-Sampling
 
+Backend: https://github.com/RWKV-Vibe/rwkv_lightning
+
 ## Result @ 251201
 
 145+ token/s RWKV-7 7.2B fp16 bsz1 @ RTX5090
