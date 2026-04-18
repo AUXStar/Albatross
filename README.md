@@ -18,6 +18,8 @@ Fast sampling: https://github.com/Triang-jyed-driung/Rapid-Sampling
 
 Code: https://github.com/Triang-jyed-driung/Albatross/tree/fp16
 
+(enable torch.compile in https://github.com/Triang-jyed-driung/Albatross/blob/fp16/reference/rwkv7.py)
+
 ## Result @ 251103
 
 10250+ token/s RWKV-7 7.2B fp16 bsz960 @ RTX5090
