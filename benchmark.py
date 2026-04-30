@@ -31,7 +31,7 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g0a-7.2b-20250829-ctx4096"
+args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1f-7.2b-20260414-ctx8192"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
@@ -255,7 +255,7 @@ for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(32, 512+32, 32)]
             print(tokenizer.decode(aaa_tokens, utf8_errors="ignore"))
             print('#'*80)
 
-    print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s')
+    print(f'Bsz {BSZ} || Token/s = {round(nnn/times,2)} (forward), {round(nnn/all_times,2)} (full) || {round(time.perf_counter()-t000,3)}s || VRAM {round(torch.cuda.memory_allocated(0) / 1e9,2)}G')
 
 #######################################################################################################
 
