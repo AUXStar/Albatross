@@ -264,7 +264,7 @@ __global__ void __launch_bounds__(_N_, 2) kernel_forward_w0_fp16_dither(
             sa2 = __hfma2(a[j], state[j], sa2);
         half sa = sa2.x + sa2.y;
         sa2 = {sa, sa};
-        ((F*)w)[i] = F(exp2f(nexp_half_log2_e / (1.0f + exp2f(nlog2_e * (float)(((F*)w)[i])))) - 1.0f + rotator1(_elapsed_t[bbb]+_t));
+        ((F*)w)[i] = F(exp2f(nexp_half_log2_e / (1.0f + exp2f(nlog2_e * (float)(((F*)w)[i])))) - 1.0f + rotator1(_elapsed_t[bbb] + h * _N_ + i + _t));
 
         cp_async_wait<0>();
         __syncthreads();
