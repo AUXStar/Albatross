@@ -42,16 +42,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
-    parser.add_argument("--cases", default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16")
+    parser.add_argument("--cases", default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16") # try 1x1024 1024x1 32x32 for extreme tps
     parser.add_argument("--profile-range", action="store_true")
     parser.add_argument("--eval-json", default="")
     parser.add_argument("--eval-out", default="")
     parser.add_argument("--eval-all-logits-out", default="")
     parser.add_argument("--eval-paths", default="b1tn")
-    parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16")
-    parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu")
-    parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off")
-    parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc")
+    parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp32io16 is more accurate
+    parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
+    parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off") # auto is slightly faster but consumes lots of VRAM
+    parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc") # auto is slightly faster but consumes lots of VRAM
     args = parser.parse_args()
 
     global WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE
@@ -231,7 +231,7 @@ class RWKV7:
         x = x[:, -1, :]
         x = F.layer_norm(x, (C,), weight=z["ln_out.weight"], bias=z["ln_out.bias"])
         out = x @ z["head.weight"]
-        state[2].add_(T)
+        state[2].add_(T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
         return out
 
     def forward_all_logits(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
