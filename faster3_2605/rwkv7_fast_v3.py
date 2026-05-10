@@ -26,18 +26,6 @@ CMIX_B1T1_NOFC = "b1t1_nofc"
 CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
 
-def log(message: str) -> None:
-    print(f"[rwkv7_fast_v3] {message}", flush=True)
-
-def cuda_mem() -> str:
-    if not torch.cuda.is_available():
-        return "cuda=unavailable"
-    free, total = torch.cuda.mem_get_info()
-    used = total - free
-    allocated = torch.cuda.memory_allocated()
-    reserved = torch.cuda.memory_reserved()
-    return f"gpu_mem used={used/2**30:.2f}GiB allocated={allocated/2**30:.2f}GiB reserved={reserved/2**30:.2f}GiB total={total/2**30:.2f}GiB"
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=1)
@@ -69,6 +57,18 @@ def main() -> None:
     for item in args.cases.replace(",", " ").split():
         B, T = [int(x) for x in item.lower().split("x", 1)]
         bench_case(model, B, T, args.warmup, args.iters, args.profile_range)
+
+def log(message: str) -> None:
+    print(f"[rwkv7_fast_v3] {message}", flush=True)
+
+def cuda_mem() -> str:
+    if not torch.cuda.is_available():
+        return "cuda=unavailable"
+    free, total = torch.cuda.mem_get_info()
+    used = total - free
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    return f"gpu_mem used={used/2**30:.2f}GiB allocated={allocated/2**30:.2f}GiB reserved={reserved/2**30:.2f}GiB total={total/2**30:.2f}GiB"
 
 @dataclass(frozen=True)
 class PathConfig:
@@ -167,9 +167,6 @@ class RWKV7:
                 chunk = F.layer_norm(chunk, (C,), weight=z["blocks.0.ln0.weight"], bias=z["blocks.0.ln0.bias"])
                 emb[start:end].copy_(chunk)
             z["emb.weight"] = emb
-        z["blocks.0.att.v0"] = z["blocks.0.att.a0"]
-        z["blocks.0.att.v1"] = z["blocks.0.att.a1"]
-        z["blocks.0.att.v2"] = z["blocks.0.att.a2"]
         if RKV_MODE != "off":
             for layer in range(L):
                 p = f"blocks.{layer}.att."
@@ -214,35 +211,7 @@ class RWKV7:
         dev.copy_(host.view(B,T,C), non_blocking=True)
         return dev
 
-    def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig) -> torch.Tensor:
-        z = self.z
-        B, T, _ = x.shape
-        v_first = torch.empty_like(x)
-
-        for layer in range(L):
-            p = f"blocks.{layer}."
-            xx = F.layer_norm(x, (C,), weight=z[p+"ln1.weight"], bias=z[p+"ln1.bias"])
-            xx, v_first = self.tmix(layer, xx, state[0][layer], state[1][layer], state[2], v_first, p+"att.", path)
-            x = x + xx
-            xx = F.layer_norm(x, (C,), weight=z[p+"ln2.weight"], bias=z[p+"ln2.bias"])
-            cmix_out = self.cmix(xx, state[0][layer], p+"ffn.", path)
-            x = x + cmix_out
-
-        x = x[:, -1, :]
-        x = F.layer_norm(x, (C,), weight=z["ln_out.weight"], bias=z["ln_out.bias"])
-        out = x @ z["head.weight"]
-        state[2].add_(T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
-        return out
-
-    def forward_all_logits(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
-        if tokens.dim() == 1:
-            tokens = tokens.unsqueeze(0)
-        B, T = tokens.shape
-        path = select_path(B, T)
-        x = self.embed(tokens)
-        return self.forward_all_logits_from_x(x, state, path)
-
-    def forward_all_logits_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig) -> torch.Tensor:
+    def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False) -> torch.Tensor:
         z = self.z
         B, T, _ = x.shape
         v_first = torch.empty_like(x)
@@ -255,9 +224,19 @@ class RWKV7:
             xx = F.layer_norm(x, (C,), weight=z[p+"ln2.weight"], bias=z[p+"ln2.bias"])
             x = x + self.cmix(xx, state[0][layer], p+"ffn.", path)
 
+        if not all_logits:
+            x = x[:, -1, :]
         x = F.layer_norm(x, (C,), weight=z["ln_out.weight"], bias=z["ln_out.bias"])
-        state[2].add_(T)
+        state[2].add_(T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
         return x @ z["head.weight"]
+
+    def forward_all_logits(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        B, T = tokens.shape
+        path = select_path(B, T)
+        x = self.embed(tokens)
+        return self.forward_from_x(x, state, path, all_logits=True)
 
     def tmix(self, layer: int, x: torch.Tensor, shift_state: torch.Tensor, wkv_state: torch.Tensor, elapsed_t: torch.Tensor, v_first: torch.Tensor, p: str, path: PathConfig) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
@@ -272,19 +251,16 @@ class RWKV7:
             r = xr @ z[p+"receptance.weight"]
             k = xk @ z[p+"key.weight"]
             v = xv @ z[p+"value.weight"]
-        w1 = xw @ z[p+"w1"]
-        a1 = xa @ z[p+"a1"]
-        if layer > 0:
-            v1 = xv @ z[p+"v1"]
-        w = ops.act_tanh(w1.contiguous()) @ z[p+"w2"]
-        a12 = a1 @ z[p+"a2"]
-        k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a12.contiguous(), z[p+"k_a"])
-        g1 = xg @ z[p+"g1"]
-        g = ops.act_sigmoid(g1.contiguous()) @ z[p+"g2"]
+
+        w = ops.act_tanh((xw @ z[p+"w1"]).contiguous()) @ z[p+"w2"]
+        a = (xa @ z[p+"a1"]) @ z[p+"a2"]
+        g = ops.act_sigmoid((xg @ z[p+"g1"]).contiguous()) @ z[p+"g2"]
+        k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
+
         if layer == 0:
             v_first = v
         else:
-            v12 = v1 @ z[p+"v2"]
+            v12 = (xv @ z[p+"v1"]) @ z[p+"v2"]
             v = ops.tmix_vres_gate(B, T, C, v.contiguous(), v_first.contiguous(), z[p+"v0"], v12.contiguous())
 
         w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
@@ -300,16 +276,19 @@ class RWKV7:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = x.shape
+
         if path.cmix_mode == CMIX_B1T1_SPARSE:
             return ops.cmix_sparse_one(C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
         if path.cmix_mode == CMIX_ROWS2_SPARSE:
             return ops.cmix_sparse_rows(B, T, C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
+
         mixed = ops.cmix_mix(B, T, C, x.contiguous(), shift_state[1], z[p+"x_k"])
         hid = mixed @ z[p+"key.weight"]
         if path.cmix_mode == CMIX_B1T1_NOFC:
             return ops.cmix_sparse_down_relu_one(C, z[p+"value.weight"].size(0), hid.view(-1).contiguous(), z[p+"value.weight"])
         if path.cmix_mode == CMIX_ROWS2_NOFC:
             return ops.cmix_sparse_down_relu_rows(B, T, C, z[p+"value.weight"].size(0), hid.contiguous(), z[p+"value.weight"])
+
         k = ops.relu_square(hid.contiguous())
         return k @ z[p+"value.weight"]
 
