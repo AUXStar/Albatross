@@ -12,6 +12,10 @@ While for demo2.py, you have to SSH to the GPU computer to run demo2.py in a SSH
 
 ---
 
+UPDATE: Now faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32).
+
+---
+
 ## Old Readme
 
 Please check this first: https://github.com/BlinkDL/Albatross/blob/main/benchmark.py
