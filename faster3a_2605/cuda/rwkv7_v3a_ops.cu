@@ -4,12 +4,14 @@
 #include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <climits>
 #include <vector>
 
 using dtype = at::Half;
+namespace wmma = nvcuda::wmma;
 
 namespace {
 
@@ -372,6 +374,152 @@ __global__ __launch_bounds__(Threads, 2) void linear_t_f16_ntile_scalar_kernel(
       if (n < N) {
         *reinterpret_cast<__half*>(y + static_cast<int64_t>(m) * N + n) = __float2half_rn(sum);
       }
+    }
+  }
+}
+
+template <int Threads, int RowTile, int OutTile>
+__global__ __launch_bounds__(Threads, 1) void linear_orig_rows_f16_kernel(
+    int M,
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * OutTile;
+  const int m0 = blockIdx.y * RowTile;
+  float acc[RowTile][OutTile];
+#pragma unroll
+  for (int r = 0; r < RowTile; ++r) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      acc[r][j] = 0.0f;
+    }
+  }
+  const int K2 = K >> 1;
+  for (int k2 = threadIdx.x; k2 < K2; k2 += Threads) {
+    const int k = k2 << 1;
+    float2 wv[OutTile];
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const int n = n0 + j;
+      wv[j] = (n < N)
+          ? __half22float2(*reinterpret_cast<const __half2*>(weight_orig + static_cast<int64_t>(n) * K + k))
+          : make_float2(0.0f, 0.0f);
+    }
+#pragma unroll
+    for (int r = 0; r < RowTile; ++r) {
+      const int m = m0 + r;
+      if (m < M) {
+        const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x + static_cast<int64_t>(m) * K + k));
+#pragma unroll
+        for (int j = 0; j < OutTile; ++j) {
+          acc[r][j] = fmaf(xv.x, wv[j].x, acc[r][j]);
+          acc[r][j] = fmaf(xv.y, wv[j].y, acc[r][j]);
+        }
+      }
+    }
+  }
+  if ((K & 1) && threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const int n = n0 + j;
+      if (n < N) {
+        const float wv = __half2float(*reinterpret_cast<const __half*>(weight_orig + static_cast<int64_t>(n) * K + K - 1));
+#pragma unroll
+        for (int r = 0; r < RowTile; ++r) {
+          const int m = m0 + r;
+          if (m < M) {
+            const float xv = __half2float(*reinterpret_cast<const __half*>(x + static_cast<int64_t>(m) * K + K - 1));
+            acc[r][j] = fmaf(xv, wv, acc[r][j]);
+          }
+        }
+      }
+    }
+  }
+  __shared__ float partial[Threads / 32][RowTile][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int r = 0; r < RowTile; ++r) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const float v = warp_sum(acc[r][j]);
+      if (lane == 0) {
+        partial[warp][r][j] = v;
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int r = 0; r < RowTile; ++r) {
+      const int m = m0 + r;
+      if (m < M) {
+#pragma unroll
+        for (int j = 0; j < OutTile; ++j) {
+          const int n = n0 + j;
+          if (n < N) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < Threads / 32; ++w) {
+              sum += partial[w][r][j];
+            }
+            *reinterpret_cast<__half*>(y + static_cast<int64_t>(m) * N + n) = __float2half_rn(sum);
+          }
+        }
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(32, 8) void linear_orig_wmma16_f16_kernel(
+    int M,
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * 16;
+  const int m0 = blockIdx.y * 16;
+  __shared__ __half a_tile[16 * 16];
+  __shared__ __half b_tile[16 * 16];
+  __shared__ float c_tile[16 * 16];
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b_frag;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+  wmma::fill_fragment(c_frag, 0.0f);
+
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    for (int idx = threadIdx.x; idx < 16 * 16; idx += 32) {
+      const int r = idx >> 4;
+      const int kk = idx & 15;
+      const int m = m0 + r;
+      a_tile[idx] = (m < M && k0 + kk < K)
+          ? *reinterpret_cast<const __half*>(x + static_cast<int64_t>(m) * K + k0 + kk)
+          : __float2half(0.0f);
+      const int n = n0 + r;
+      b_tile[r * 16 + kk] = (n < N && k0 + kk < K)
+          ? *reinterpret_cast<const __half*>(weight_orig + static_cast<int64_t>(n) * K + k0 + kk)
+          : __float2half(0.0f);
+    }
+    __syncwarp();
+    wmma::load_matrix_sync(a_frag, a_tile, 16);
+    wmma::load_matrix_sync(b_frag, b_tile, 16);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    __syncwarp();
+  }
+
+  wmma::store_matrix_sync(c_tile, c_frag, 16, wmma::mem_row_major);
+  __syncwarp();
+  for (int idx = threadIdx.x; idx < 16 * 16; idx += 32) {
+    const int r = idx >> 4;
+    const int j = idx & 15;
+    const int m = m0 + r;
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      *reinterpret_cast<__half*>(y + static_cast<int64_t>(m) * N + n) = __float2half_rn(c_tile[idx]);
     }
   }
 }
@@ -2020,6 +2168,250 @@ at::Tensor linear_f16_cuda(at::Tensor x, at::Tensor weight) {
       CUBLAS_COMPUTE_32F,
       CUBLAS_GEMM_DEFAULT_TENSOR_OP),
       "linear_f16 cublasGemmEx");
+  return y;
+}
+
+at::Tensor linear_f16_orig_cuda(at::Tensor x, at::Tensor weight_orig) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig K/N too large");
+  const int k = static_cast<int>(k64);
+  const int n = static_cast<int>(n64);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig M too large");
+  const int m = static_cast<int>(m64);
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = n64;
+  auto y = at::empty(out_sizes, x.options());
+  if (m == 0 || n == 0 || k == 0) {
+    return y;
+  }
+
+  // weight_orig is row-major [N,K], i.e. column-major [K,N].
+  // Row-major y[M,N] = x[M,K] @ weight_orig[N,K]^T becomes
+  // column-major y^T[N,M] = opT(weight_orig_col[K,N]) @ x_col[K,M].
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+  check_cublas(cublasGemmEx(
+      handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      n,
+      m,
+      k,
+      &alpha,
+      weight_orig.data_ptr<dtype>(),
+      CUDA_R_16F,
+      k,
+      x.data_ptr<dtype>(),
+      CUDA_R_16F,
+      k,
+      &beta,
+      y.data_ptr<dtype>(),
+      CUDA_R_16F,
+      n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+      "linear_f16_orig cublasGemmEx");
+  return y;
+}
+
+template <int RowTile, int OutTile>
+at::Tensor linear_orig_rows_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_f16 K/N too large");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_f16 M too large");
+  const int M = static_cast<int>(m64);
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = n64;
+  auto y = at::empty(out_sizes, x.options());
+  if (M == 0 || N == 0 || K == 0) {
+    return y;
+  }
+  auto stream = at::cuda::getCurrentCUDAStream();
+  linear_orig_rows_f16_kernel<128, RowTile, OutTile><<<dim3(ceil_div(N, OutTile), ceil_div(M, RowTile), 1), 128, 0, stream>>>(
+      M, K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+template <int Threads, int RowTile, int OutTile>
+at::Tensor linear_orig_rows_cfg_f16_cuda_impl(at::Tensor x, at::Tensor weight_orig) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_rows_cfg_f16 K/N too large");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(m64 <= INT_MAX, "linear_orig_rows_cfg_f16 M too large");
+  const int M = static_cast<int>(m64);
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = n64;
+  auto y = at::empty(out_sizes, x.options());
+  if (M == 0 || N == 0 || K == 0) {
+    return y;
+  }
+  auto stream = at::cuda::getCurrentCUDAStream();
+  linear_orig_rows_f16_kernel<Threads, RowTile, OutTile><<<dim3(ceil_div(N, OutTile), ceil_div(M, RowTile), 1), Threads, 0, stream>>>(
+      M, K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+at::Tensor linear_orig_rows_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64_t row_tile, int64_t out_tile) {
+  if (row_tile == 1 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<1, 2>(x, weight_orig);
+  if (row_tile == 1 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<1, 4>(x, weight_orig);
+  if (row_tile == 1 && out_tile == 8) return linear_orig_rows_f16_cuda_impl<1, 8>(x, weight_orig);
+  if (row_tile == 1 && out_tile == 16) return linear_orig_rows_f16_cuda_impl<1, 16>(x, weight_orig);
+  if (row_tile == 2 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<2, 2>(x, weight_orig);
+  if (row_tile == 2 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<2, 4>(x, weight_orig);
+  if (row_tile == 2 && out_tile == 8) return linear_orig_rows_f16_cuda_impl<2, 8>(x, weight_orig);
+  if (row_tile == 3 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<3, 2>(x, weight_orig);
+  if (row_tile == 3 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<3, 4>(x, weight_orig);
+  if (row_tile == 3 && out_tile == 8) return linear_orig_rows_f16_cuda_impl<3, 8>(x, weight_orig);
+  if (row_tile == 4 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<4, 2>(x, weight_orig);
+  if (row_tile == 4 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<4, 4>(x, weight_orig);
+  if (row_tile == 4 && out_tile == 8) return linear_orig_rows_f16_cuda_impl<4, 8>(x, weight_orig);
+  if (row_tile == 8 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<8, 2>(x, weight_orig);
+  if (row_tile == 8 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<8, 4>(x, weight_orig);
+  if (row_tile == 16 && out_tile == 1) return linear_orig_rows_f16_cuda_impl<16, 1>(x, weight_orig);
+  if (row_tile == 16 && out_tile == 2) return linear_orig_rows_f16_cuda_impl<16, 2>(x, weight_orig);
+  if (row_tile == 16 && out_tile == 4) return linear_orig_rows_f16_cuda_impl<16, 4>(x, weight_orig);
+  TORCH_CHECK(false, "unsupported linear_orig_rows_f16 row_tile/out_tile");
+}
+
+at::Tensor linear_orig_rows_cfg_f16_cuda(at::Tensor x, at::Tensor weight_orig, int64_t threads, int64_t row_tile, int64_t out_tile) {
+  if (threads == 64 && row_tile == 1 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 1, 4>(x, weight_orig);
+  if (threads == 64 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<64, 1, 8>(x, weight_orig);
+  if (threads == 128 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<128, 1, 8>(x, weight_orig);
+  if (threads == 32 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<32, 4, 4>(x, weight_orig);
+  if (threads == 64 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 4, 4>(x, weight_orig);
+  if (threads == 96 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<96, 4, 4>(x, weight_orig);
+  if (threads == 32 && row_tile == 4 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<32, 4, 8>(x, weight_orig);
+  if (threads == 64 && row_tile == 4 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<64, 4, 8>(x, weight_orig);
+  if (threads == 32 && row_tile == 8 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<32, 8, 4>(x, weight_orig);
+  if (threads == 64 && row_tile == 8 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 8, 4>(x, weight_orig);
+  if (threads == 32 && row_tile == 2 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<32, 2, 4>(x, weight_orig);
+  if (threads == 64 && row_tile == 2 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 2, 4>(x, weight_orig);
+  if (threads == 32 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<32, 3, 4>(x, weight_orig);
+  if (threads == 64 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<64, 3, 4>(x, weight_orig);
+  if (threads == 96 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_f16_cuda_impl<96, 3, 4>(x, weight_orig);
+  if (threads == 32 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<32, 3, 8>(x, weight_orig);
+  if (threads == 64 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_f16_cuda_impl<64, 3, 8>(x, weight_orig);
+  TORCH_CHECK(false, "unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
+}
+
+at::Tensor linear_orig_wmma16_f16_cuda(at::Tensor x, at::Tensor weight_orig) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_orig_wmma16_f16 K/N too large");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(m64 <= INT_MAX, "linear_orig_wmma16_f16 M too large");
+  const int M = static_cast<int>(m64);
+  TORCH_CHECK((K % 16) == 0 && (N % 16) == 0, "linear_orig_wmma16_f16 requires K/N multiple of 16");
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = n64;
+  auto y = at::empty(out_sizes, x.options());
+  if (M == 0 || N == 0 || K == 0) {
+    return y;
+  }
+  auto stream = at::cuda::getCurrentCUDAStream();
+  linear_orig_wmma16_f16_kernel<<<dim3(N / 16, ceil_div(M, 16), 1), 32, 0, stream>>>(
+      M, K, N, x.data_ptr<dtype>(), weight_orig.data_ptr<dtype>(), y.data_ptr<dtype>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return y;
+}
+
+at::Tensor linear_f16_orig_lt_cfg_cuda(at::Tensor x, at::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index);
+
+at::Tensor linear_f16_orig_lt_cuda(at::Tensor x, at::Tensor weight_orig) {
+  return linear_f16_orig_lt_cfg_cuda(x, weight_orig, 0, 0);
+}
+
+at::Tensor linear_f16_orig_lt_cfg_cuda(at::Tensor x, at::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index) {
+  const int64_t k64 = x.size(-1);
+  const int64_t n64 = weight_orig.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_f16_orig_lt_cfg K/N too large");
+  const int k = static_cast<int>(k64);
+  const int n = static_cast<int>(n64);
+  const int64_t m64 = x.numel() / k64;
+  TORCH_CHECK(m64 <= INT_MAX, "linear_f16_orig_lt_cfg M too large");
+  const int m = static_cast<int>(m64);
+  std::vector<int64_t> out_sizes(x.sizes().begin(), x.sizes().end());
+  out_sizes.back() = n64;
+  auto y = at::empty(out_sizes, x.options());
+  if (m == 0 || n == 0 || k == 0) {
+    return y;
+  }
+
+  const size_t workspace_size = static_cast<size_t>(workspace_mb) << 20;
+  at::Tensor workspace;
+  void* workspace_ptr = nullptr;
+  if (workspace_size > 0) {
+    workspace = at::empty({static_cast<int64_t>(workspace_size)}, x.options().dtype(at::kByte));
+    workspace_ptr = workspace.data_ptr();
+  }
+
+  static cublasLtHandle_t lt_handle = nullptr;
+  if (lt_handle == nullptr) {
+    check_cublaslt(cublasLtCreate(&lt_handle), "cublasLtCreate");
+  }
+
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t a_desc = nullptr;
+  cublasLtMatrixLayout_t b_desc = nullptr;
+  cublasLtMatrixLayout_t c_desc = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+  check_cublaslt(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F), "linear_f16_orig_lt desc");
+  const cublasOperation_t transa = CUBLAS_OP_T;
+  const cublasOperation_t transb = CUBLAS_OP_N;
+  check_cublaslt(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)), "linear_f16_orig_lt transa");
+  check_cublaslt(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, sizeof(transb)), "linear_f16_orig_lt transb");
+  check_cublaslt(cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_16F, k, n, k), "linear_f16_orig_lt a layout");
+  check_cublaslt(cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_16F, k, m, k), "linear_f16_orig_lt b layout");
+  check_cublaslt(cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_16F, n, m, n), "linear_f16_orig_lt c layout");
+  check_cublaslt(cublasLtMatmulPreferenceCreate(&pref), "linear_f16_orig_lt preference");
+  check_cublaslt(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)),
+                 "linear_f16_orig_lt workspace");
+
+  std::vector<cublasLtMatmulHeuristicResult_t> heuristics(64);
+  int returned = 0;
+  check_cublaslt(cublasLtMatmulAlgoGetHeuristic(lt_handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref, static_cast<int>(heuristics.size()), heuristics.data(), &returned),
+                 "linear_f16_orig_lt heuristic");
+  TORCH_CHECK(returned > 0, "linear_f16_orig_lt found no algorithm");
+  TORCH_CHECK(algo_index < returned, "linear_f16_orig_lt_cfg algo_index=", algo_index, " returned=", returned);
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  check_cublaslt(cublasLtMatmul(
+      lt_handle,
+      op_desc,
+      &alpha,
+      weight_orig.data_ptr<dtype>(),
+      a_desc,
+      x.data_ptr<dtype>(),
+      b_desc,
+      &beta,
+      y.data_ptr<dtype>(),
+      c_desc,
+      y.data_ptr<dtype>(),
+      c_desc,
+      &heuristics[algo_index].algo,
+      workspace_ptr,
+      workspace_size,
+      at::cuda::getCurrentCUDAStream()),
+      "linear_f16_orig_lt matmul");
+  cublasLtMatmulPreferenceDestroy(pref);
+  cublasLtMatrixLayoutDestroy(c_desc);
+  cublasLtMatrixLayoutDestroy(b_desc);
+  cublasLtMatrixLayoutDestroy(a_desc);
+  cublasLtMatmulDescDestroy(op_desc);
   return y;
 }
 
