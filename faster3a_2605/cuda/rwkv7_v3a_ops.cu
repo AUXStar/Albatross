@@ -49,6 +49,15 @@ __device__ __forceinline__ float warp_sum(float x) {
   return x;
 }
 
+__device__ __forceinline__ float bf16_bits_to_float_dev(uint16_t bits) {
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.u = static_cast<uint32_t>(bits) << 16;
+  return v.f;
+}
+
 template <int Threads>
 __device__ __forceinline__ float block_sum_t(float x) {
   __shared__ float partial[Threads / 32];
@@ -68,6 +77,41 @@ __device__ __forceinline__ float block_sum_t(float x) {
   }
   __syncthreads();
   return partial[0];
+}
+
+__global__ void emb_ln0_bf16_to_f16_kernel(
+    int V,
+    int C,
+    const uint16_t* __restrict__ emb,
+    const uint16_t* __restrict__ weight,
+    const uint16_t* __restrict__ bias,
+    dtype* __restrict__ out,
+    float eps) {
+  // Precision path: bf16 inputs -> fp32 two-pass stats/affine -> fp16 output.
+  const int tok = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (tok >= V) {
+    return;
+  }
+  const uint16_t* er = emb + static_cast<int64_t>(tok) * C;
+  float sum = 0.0f;
+  for (int c = tid; c < C; c += blockDim.x) {
+    sum += bf16_bits_to_float_dev(er[c]);
+  }
+  const float mean = block_sum_t<256>(sum) / static_cast<float>(C);
+  float var = 0.0f;
+  for (int c = tid; c < C; c += blockDim.x) {
+    const float d = bf16_bits_to_float_dev(er[c]) - mean;
+    var += d * d;
+  }
+  const float rstd = rsqrtf(block_sum_t<256>(var) / static_cast<float>(C) + eps);
+  dtype* yr = out + static_cast<int64_t>(tok) * C;
+  for (int c = tid; c < C; c += blockDim.x) {
+    const float x = bf16_bits_to_float_dev(er[c]);
+    const float w = bf16_bits_to_float_dev(weight[c]);
+    const float b = bf16_bits_to_float_dev(bias[c]);
+    yr[c] = static_cast<dtype>((x - mean) * rstd * w + b);
+  }
 }
 
 __global__ void add_f16_kernel(
@@ -1825,6 +1869,25 @@ at::Tensor layer_norm_f16_small512_cuda(at::Tensor x, at::Tensor weight, at::Ten
       static_cast<float>(eps));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return y;
+}
+
+at::Tensor emb_ln0_bf16_to_f16_cuda(at::Tensor emb, at::Tensor weight, at::Tensor bias, double eps) {
+  auto out = at::empty(emb.sizes(), emb.options().dtype(at::kHalf));
+  const int64_t v64 = emb.size(0);
+  const int64_t c64 = emb.size(1);
+  TORCH_CHECK(v64 <= INT_MAX && c64 <= INT_MAX, "emb shape too large");
+  const int V = static_cast<int>(v64);
+  const int C = static_cast<int>(c64);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  emb_ln0_bf16_to_f16_kernel<<<V, 256, 0, stream>>>(
+      V, C,
+      reinterpret_cast<const uint16_t*>(emb.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const uint16_t*>(weight.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const uint16_t*>(bias.data_ptr<at::BFloat16>()),
+      out.data_ptr<dtype>(),
+      static_cast<float>(eps));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
 }
 
 std::vector<at::Tensor> add_layer_norm_f16_cuda(at::Tensor x, at::Tensor residual, at::Tensor weight, at::Tensor bias, double eps) {

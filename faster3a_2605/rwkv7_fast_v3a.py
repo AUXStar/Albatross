@@ -167,7 +167,10 @@ class RWKV7:
         assert N == HEAD_SIZE
         log(f"detected model C={C} H={H} N={N} V={V}")
 
-        emb_cpu = z["emb.weight"].squeeze() if EMB_DEVICE == "cpu" else None
+        emb_src = z["emb.weight"].squeeze()
+        ln0_w_src = z["blocks.0.ln0.weight"].squeeze()
+        ln0_b_src = z["blocks.0.ln0.bias"].squeeze()
+        emb_cpu = emb_src if EMB_DEVICE == "cpu" else None
         max_layer = -1
         t0 = time.perf_counter()
         log(f"moving and preprocessing weights to CUDA emb={EMB_DEVICE}")
@@ -196,14 +199,17 @@ class RWKV7:
                 max_layer = max(max_layer, int(parts[1]))
 
         L = max_layer + 1
+        ln0_w_bf16 = ln0_w_src.to(device="cuda").contiguous()
+        ln0_b_bf16 = ln0_b_src.to(device="cuda").contiguous()
         if emb_cpu is None:
-            z["emb.weight"] = self.ln(z["emb.weight"], z["blocks.0.ln0.weight"], z["blocks.0.ln0.bias"]).contiguous()
+            z["emb.weight"] = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
+                emb_src.to(device="cuda").contiguous(), ln0_w_bf16, ln0_b_bf16)
         else:
             emb = torch.empty((V,C), dtype=DTYPE, pin_memory=True)
             for start in range(0, V, 4096):
                 end = min(start + 4096, V)
-                chunk = emb_cpu[start:end].to(device="cuda", dtype=DTYPE)
-                chunk = self.ln(chunk, z["blocks.0.ln0.weight"], z["blocks.0.ln0.bias"])
+                chunk = emb_cpu[start:end].to(device="cuda").contiguous()
+                chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
                 emb[start:end].copy_(chunk)
             z["emb.weight"] = emb
         if RKV_MODE != "off" and not use_orig_linear("att_c2c"):

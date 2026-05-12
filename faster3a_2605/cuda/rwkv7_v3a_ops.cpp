@@ -2,6 +2,7 @@
 #include <vector>
 
 torch::Tensor layer_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
+torch::Tensor emb_ln0_bf16_to_f16_cuda(torch::Tensor emb, torch::Tensor weight, torch::Tensor bias, double eps);
 torch::Tensor layer_norm_f16_small_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
 torch::Tensor layer_norm_f16_small512_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
 torch::Tensor linear_f16_cuda(torch::Tensor x, torch::Tensor weight);
@@ -67,6 +68,12 @@ void check_i32_cuda_contig(const torch::Tensor& x, const char* name) {
   TORCH_CHECK(x.scalar_type() == torch::kInt32, name, " must be int32");
 }
 
+void check_bf16_cuda_contig(const torch::Tensor& x, const char* name) {
+  TORCH_CHECK(x.is_cuda(), name, " must be CUDA");
+  TORCH_CHECK(x.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(x.scalar_type() == torch::kBFloat16, name, " must be bf16");
+}
+
 torch::Tensor layer_norm_f16(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps) {
   check_half_cuda_contig(x, "x");
   check_half_cuda_contig(weight, "weight");
@@ -77,6 +84,18 @@ torch::Tensor layer_norm_f16(torch::Tensor x, torch::Tensor weight, torch::Tenso
   TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
   TORCH_CHECK(c > 0 && c <= 8192, "unsupported C");
   return layer_norm_f16_cuda(x, weight, bias, eps);
+}
+
+torch::Tensor emb_ln0_bf16_to_f16(torch::Tensor emb, torch::Tensor weight, torch::Tensor bias, double eps) {
+  check_bf16_cuda_contig(emb, "emb");
+  check_bf16_cuda_contig(weight, "weight");
+  check_bf16_cuda_contig(bias, "bias");
+  TORCH_CHECK(emb.dim() == 2, "emb must have shape [V, C]");
+  const int64_t c = emb.size(1);
+  TORCH_CHECK(c == 4096, "emb_ln0_bf16_to_f16 currently requires C=4096");
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
+  return emb_ln0_bf16_to_f16_cuda(emb, weight, bias, eps);
 }
 
 torch::Tensor layer_norm_f16_small(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps) {
@@ -574,6 +593,7 @@ void advance_i32(torch::Tensor x, int64_t amount) {
 
 TORCH_LIBRARY(rwkv7_v3a_ops, m) {
   m.def("layer_norm_f16(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
+  m.def("emb_ln0_bf16_to_f16(Tensor emb, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
   m.def("layer_norm_f16_small(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
   m.def("layer_norm_f16_small512(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
   m.def("linear_f16(Tensor x, Tensor weight) -> Tensor");
@@ -610,6 +630,7 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
 
 TORCH_LIBRARY_IMPL(rwkv7_v3a_ops, CUDA, m) {
   m.impl("layer_norm_f16", &layer_norm_f16);
+  m.impl("emb_ln0_bf16_to_f16", &emb_ln0_bf16_to_f16);
   m.impl("layer_norm_f16_small", &layer_norm_f16_small);
   m.impl("layer_norm_f16_small512", &layer_norm_f16_small512);
   m.impl("linear_f16", &linear_f16);
