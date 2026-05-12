@@ -20,16 +20,11 @@ WKV_MODE = "fp16"
 EMB_DEVICE = "cpu"
 RKV_MODE = "off"
 CMIX_SPARSE = "no-fc"
-LN_MODE = "v3a"
-LINEAR_MODE = "v3a"
-LINEAR_M1 = "splitk"
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
 CMIX_NOFC_MAX_ROWS = 19
 CMIX_NOFC_ROW20_MAX_T = 5
 CMIX_NOFC_T512_MIN_ROWS = 8
-DIRECT_MIX = False
-DIRECT_MIX_FUSE_SHIFT = False
 LN1_TMIX_FUSE = True
 CMIX_B1T1_SPARSE = "b1t1_sparse"
 CMIX_ROWS2_SPARSE = "rows2_sparse"
@@ -59,7 +54,7 @@ def main() -> None:
     RKV_MODE = args.batched_rkv
     CMIX_SPARSE = args.cmix_sparse
     log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE}")
-    log(f"fixed fast path: ln={LN_MODE} linear={LINEAR_MODE}/{LINEAR_M1} lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows<={CMIX_NOFC_MAX_ROWS} row20_t<={CMIX_NOFC_ROW20_MAX_T} nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
+    log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows<={CMIX_NOFC_MAX_ROWS} row20_t<={CMIX_NOFC_ROW20_MAX_T} nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
     load_extensions(WKV_MODE)
     model = RWKV7()
     if args.eval_json:
@@ -238,7 +233,7 @@ class RWKV7:
             p = f"blocks.{layer}."
             xx, v_first = self.tmix(layer, xx, state[0][layer], state[1][layer], state[2], v_first, p+"att.", path, pre_mix)
             pre_mix = None
-            if LN_MODE == "v3a" and T == 1 and path.cmix_mode not in (CMIX_B1T1_SPARSE, CMIX_ROWS2_SPARSE):
+            if T == 1 and path.cmix_mode not in (CMIX_B1T1_SPARSE, CMIX_ROWS2_SPARSE):
                 x, mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16(
                     x.contiguous(), xx.contiguous(), state[0][layer][1], z[p+"ln2.weight"], z[p+"ln2.bias"], z[p+"ffn.x_k"])
                 xx = self.cmix_from_mixed(mixed, p+"ffn.", path)
@@ -247,7 +242,7 @@ class RWKV7:
                 xx = self.cmix(xx, state[0][layer], p+"ffn.", path)
             if layer + 1 < L:
                 p_next = f"blocks.{layer + 1}."
-                if LN1_TMIX_FUSE and LN_MODE == "v3a" and B == 1 and T == 1 and not DIRECT_MIX:
+                if LN1_TMIX_FUSE and B == 1 and T == 1:
                     outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
                         x.contiguous(), xx.contiguous(), state[0][layer + 1][0],
                         z[p_next+"ln1.weight"], z[p_next+"ln1.bias"],
@@ -269,9 +264,7 @@ class RWKV7:
         return self.linear(x, z["head.weight"])
 
     def ln(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        if LN_MODE == "v3a":
-            return torch.ops.rwkv7_v3a_ops.layer_norm_f16(x.contiguous(), weight, bias)
-        return F.layer_norm(x, (C,), weight=weight, bias=bias)
+        return torch.ops.rwkv7_v3a_ops.layer_norm_f16(x.contiguous(), weight, bias)
 
     def forward_all_logits(self, tokens: torch.Tensor, state: list[torch.Tensor]) -> torch.Tensor:
         if tokens.dim() == 1:
@@ -285,14 +278,8 @@ class RWKV7:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = x.shape
-        direct_mix = DIRECT_MIX and B == 1 and T == 1 and not path.use_batched_rkv and LINEAR_MODE == "v3a"
         if pre_mix is not None:
             xr, xw, xk, xv, xa, xg = pre_mix
-        elif direct_mix:
-            s0 = shift_state[0]
-            r = torch.ops.rwkv7_v3a_ops.linear_mix_f16_m1_splitk(x.contiguous(), s0, z[p+"x_r"], z[p+"receptance.weight"])
-            k = torch.ops.rwkv7_v3a_ops.linear_mix_f16_m1_splitk(x.contiguous(), s0, z[p+"x_k"], z[p+"key.weight"])
-            v = torch.ops.rwkv7_v3a_ops.linear_mix_f16_m1_splitk(x.contiguous(), s0, z[p+"x_v"], z[p+"value.weight"])
         else:
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6(B, T, C, x.contiguous(), shift_state[0], z[p+"x_r"], z[p+"x_w"], z[p+"x_k"], z[p+"x_v"], z[p+"x_a"], z[p+"x_g"])
         if pre_mix is not None:
@@ -304,7 +291,7 @@ class RWKV7:
                 r = self.linear(xr, z[p+"receptance.weight"])
                 k = self.linear(xk, z[p+"key.weight"])
                 v = self.linear(xv, z[p+"value.weight"])
-        elif not direct_mix:
+        else:
             if path.use_batched_rkv:
                 flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
                 rkv = torch.bmm(flat, z[p+"rkv.weight"])
@@ -315,22 +302,11 @@ class RWKV7:
                 v = self.linear(xv, z[p+"value.weight"])
 
         v1 = None
-        if direct_mix and path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
-            w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_mix_f16(
-                x.contiguous(), s0, z[p+"x_w"], z[p+"x_a"], z[p+"x_g"], z[p+"x_v"],
-                z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"], z[p+"v1.t"])
-            if not DIRECT_MIX_FUSE_SHIFT:
-                torch.ops.rwkv7_v3a_ops.copy_m1_to_shift_f16(x.contiguous(), s0)
-        elif direct_mix and path.rows <= LOWRANK_IN_ROWS_T:
-            w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_mix_f16(
-                x.contiguous(), s0, z[p+"x_w"], z[p+"x_a"], z[p+"x_g"], z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"])
-            if not DIRECT_MIX_FUSE_SHIFT:
-                torch.ops.rwkv7_v3a_ops.copy_m1_to_shift_f16(x.contiguous(), s0)
-        elif LINEAR_MODE == "v3a" and path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
+        if path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
             w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), xv.contiguous(),
                 z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"], z[p+"v1.t"])
-        elif LINEAR_MODE == "v3a" and path.rows <= LOWRANK_IN_ROWS_T:
+        elif path.rows <= LOWRANK_IN_ROWS_T:
             w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"])
         else:
@@ -338,28 +314,25 @@ class RWKV7:
             a1 = self.linear_rank_in(xa, z[p+"a1"], z[p+"a1.t"], path.rows)
             g1 = self.linear_rank_in(xg, z[p+"g1"], z[p+"g1.t"], path.rows)
         v_done = False
-        if LINEAR_MODE == "v3a" and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0 and v1 is not None:
+        if path.rows <= LOWRANK_OUT_ROWS_T and layer != 0 and v1 is not None:
             w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), v1.contiguous(),
                 z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"], z[p+"v2.t"],
                 v.contiguous(), v_first.contiguous(), z[p+"v0"])
             v_done = True
-        elif LINEAR_MODE == "v3a" and path.rows <= LOWRANK_OUT_ROWS_T:
+        elif path.rows <= LOWRANK_OUT_ROWS_T:
             w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"])
         else:
             w = self.linear_rank_out_act(w1, z[p+"w2"], z[p+"w2.t"], path.rows, 1)
             a = self.linear_rank_out(a1, z[p+"a2"], z[p+"a2.t"], path.rows)
             g = self.linear_rank_out_act(g1, z[p+"g2"], z[p+"g2.t"], path.rows, 2)
-        if direct_mix and DIRECT_MIX_FUSE_SHIFT:
-            k, neg_kk, kka = ops.tmix_kk_a_gate_update_shift(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"], x.contiguous(), s0)
-        else:
-            k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
+        k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
 
         if layer == 0:
             v_first = v
         elif not v_done:
-            if LINEAR_MODE == "v3a" and path.rows <= LOWRANK_OUT_ROWS_T:
+            if path.rows <= LOWRANK_OUT_ROWS_T:
                 if v1 is None:
                     v1 = self.linear_rank_in(xv, z[p+"v1"], z[p+"v1.t"], path.rows)
                 v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(v1.contiguous(), z[p+"v2.t"], v.contiguous(), v_first.contiguous(), z[p+"v0"])
@@ -409,26 +382,22 @@ class RWKV7:
         return self.linear(k, z[p+"value.weight"])
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        if LINEAR_MODE == "v3a":
-            if LINEAR_M1 == "splitk" and x.numel() == x.size(-1):
-                return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
-            if LINEAR_M1 == "lt-c2c" and x.numel() == C and weight.size(0) == C and weight.size(1) == C:
-                return torch.ops.rwkv7_v3a_ops.linear_f16_lt(x.contiguous(), weight)
-            return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
-        return x @ weight
+        if x.numel() == x.size(-1):
+            return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
+        return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
     def linear_rank_in(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int) -> torch.Tensor:
-        if LINEAR_MODE == "v3a" and rows <= LOWRANK_IN_ROWS_T:
+        if rows <= LOWRANK_IN_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         return self.linear(x, weight)
 
     def linear_rank_out(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int) -> torch.Tensor:
-        if LINEAR_MODE == "v3a" and rows <= LOWRANK_OUT_ROWS_T:
+        if rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         return self.linear(x, weight)
 
     def linear_rank_out_act(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int, act: int) -> torch.Tensor:
-        if LINEAR_MODE == "v3a" and rows <= LOWRANK_OUT_ROWS_T:
+        if rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(x.contiguous(), weight_t, act)
         ops = torch.ops.rwkv7_fast_ops_fp16
         x = ops.act_tanh(x.contiguous()) if act == 1 else ops.act_sigmoid(x.contiguous())
@@ -438,17 +407,11 @@ class RWKV7:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())
 
     def add_ln(self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if LN_MODE == "v3a":
-            outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16(x.contiguous(), residual.contiguous(), weight, bias)
-            return outs[0], outs[1]
-        x = x + residual
-        return x, F.layer_norm(x, (C,), weight=weight, bias=bias)
+        outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_f16(x.contiguous(), residual.contiguous(), weight, bias)
+        return outs[0], outs[1]
 
     def add_last_ln(self, x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-        if LN_MODE == "v3a":
-            return torch.ops.rwkv7_v3a_ops.add_last_layer_norm_f16(x.contiguous(), residual.contiguous(), weight, bias)
-        x = (x + residual)[:, -1, :]
-        return F.layer_norm(x, (C,), weight=weight, bias=bias)
+        return torch.ops.rwkv7_v3a_ops.add_last_layer_norm_f16(x.contiguous(), residual.contiguous(), weight, bias)
 
 def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_range: bool) -> None:
     def percentile(values: list[float], q: float) -> float:
@@ -494,7 +457,7 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     p90 = percentile(times, 90)
     tok_s = B*T*1000.0 / p50
     print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
-    print(f"csv,rwkv7_fast_v3a_ln_{LN_MODE}_linear_{LINEAR_MODE},{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+    print(f"csv,rwkv7_fast_v3a,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
 
 def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths: str) -> None:
     with open(eval_json, "r", encoding="utf-8") as f:
@@ -528,7 +491,7 @@ def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths
         p99 = torch.quantile(loss_cpu.float(), 0.99).item()
         tok_s = loss_cpu.numel() / dt
         print(
-            f"EVAL label=rwkv7_fast_v3a_ln_{LN_MODE}_linear_{LINEAR_MODE} path={path} positions={loss_cpu.numel()} "
+            f"EVAL label=rwkv7_fast_v3a path={path} positions={loss_cpu.numel()} "
             f"mean_loss={loss_cpu.mean().item():.8f} p90_loss={p90:.8f} p99_loss={p99:.8f} "
             f"max_loss={loss_cpu.max().item():.8f} min_loss={loss_cpu.min().item():.8f} "
             f"time_s={dt:.3f} tok_s={tok_s:.3f}",
@@ -537,7 +500,7 @@ def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths
         if logits_out and path == "b1tn":
             torch.save(logits.detach().cpu(), logits_out)
         outputs[path] = {
-            "label": f"rwkv7_fast_v3a_ln_{LN_MODE}_linear_{LINEAR_MODE}",
+            "label": "rwkv7_fast_v3a",
             "path": path,
             "tokens": ids,
             "loss": loss_cpu,
