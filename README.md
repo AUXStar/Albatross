@@ -38,6 +38,9 @@ RESULT B=4 T=4 iters=3 p10_ms=9.1181 p50_ms=9.1330 p90_ms=9.2556 tok_s_p50=1751.
 RESULT B=8 T=8 iters=3 p10_ms=11.0723 p50_ms=11.0758 p90_ms=11.2748 tok_s_p50=5778.38
 RESULT B=16 T=16 iters=3 p10_ms=14.8019 p50_ms=14.8049 p90_ms=14.8631 tok_s_p50=17291.61
 ```
+(for better performance, tune linear_orig_layout for your GPU)
+
+UPDATE: faster4_2605_cpp as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
 
 ---
 
