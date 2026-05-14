@@ -9,6 +9,7 @@ torch::Tensor linear_f16_cuda(torch::Tensor x, torch::Tensor weight);
 torch::Tensor linear_f16_orig_cuda(torch::Tensor x, torch::Tensor weight_orig);
 torch::Tensor linear_orig_rows_f16_cuda(torch::Tensor x, torch::Tensor weight_orig, int64_t row_tile, int64_t out_tile);
 torch::Tensor linear_orig_rows_cfg_f16_cuda(torch::Tensor x, torch::Tensor weight_orig, int64_t threads, int64_t row_tile, int64_t out_tile);
+torch::Tensor linear_orig_rows_exact_f16_cuda(torch::Tensor x, torch::Tensor weight_orig, int64_t threads, int64_t out_tile, bool use4);
 torch::Tensor linear_orig_wmma16_f16_cuda(torch::Tensor x, torch::Tensor weight_orig);
 torch::Tensor linear_f16_orig_lt_cuda(torch::Tensor x, torch::Tensor weight_orig);
 torch::Tensor linear_f16_orig_lt_cfg_cuda(torch::Tensor x, torch::Tensor weight_orig, int64_t workspace_mb, int64_t algo_index);
@@ -156,6 +157,15 @@ torch::Tensor linear_orig_rows_cfg_f16(torch::Tensor x, torch::Tensor weight_ori
   TORCH_CHECK(weight_orig.dim() == 2, "weight_orig must have shape [N, K]");
   TORCH_CHECK(x.size(-1) == weight_orig.size(1), "linear_orig_rows_cfg_f16 shape mismatch");
   return linear_orig_rows_cfg_f16_cuda(x, weight_orig, threads, row_tile, out_tile);
+}
+
+torch::Tensor linear_orig_rows_exact_f16(torch::Tensor x, torch::Tensor weight_orig, int64_t threads, int64_t out_tile, bool use4) {
+  check_half_cuda_contig(x, "x");
+  check_half_cuda_contig(weight_orig, "weight_orig");
+  TORCH_CHECK(x.dim() >= 2, "x must have at least 2 dims");
+  TORCH_CHECK(weight_orig.dim() == 2, "weight_orig must have shape [N, K]");
+  TORCH_CHECK(x.size(-1) == weight_orig.size(1), "linear_orig_rows_exact_f16 shape mismatch");
+  return linear_orig_rows_exact_f16_cuda(x, weight_orig, threads, out_tile, use4);
 }
 
 torch::Tensor linear_orig_wmma16_f16(torch::Tensor x, torch::Tensor weight_orig) {
@@ -600,6 +610,7 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
   m.def("linear_f16_orig(Tensor x, Tensor weight_orig) -> Tensor");
   m.def("linear_orig_rows_f16(Tensor x, Tensor weight_orig, int row_tile, int out_tile) -> Tensor");
   m.def("linear_orig_rows_cfg_f16(Tensor x, Tensor weight_orig, int threads, int row_tile, int out_tile) -> Tensor");
+  m.def("linear_orig_rows_exact_f16(Tensor x, Tensor weight_orig, int threads, int out_tile, bool use4) -> Tensor");
   m.def("linear_orig_wmma16_f16(Tensor x, Tensor weight_orig) -> Tensor");
   m.def("linear_f16_orig_lt(Tensor x, Tensor weight_orig) -> Tensor");
   m.def("linear_f16_orig_lt_cfg(Tensor x, Tensor weight_orig, int workspace_mb, int algo_index) -> Tensor");
@@ -637,6 +648,7 @@ TORCH_LIBRARY_IMPL(rwkv7_v3a_ops, CUDA, m) {
   m.impl("linear_f16_orig", &linear_f16_orig);
   m.impl("linear_orig_rows_f16", &linear_orig_rows_f16);
   m.impl("linear_orig_rows_cfg_f16", &linear_orig_rows_cfg_f16);
+  m.impl("linear_orig_rows_exact_f16", &linear_orig_rows_exact_f16);
   m.impl("linear_orig_wmma16_f16", &linear_orig_wmma16_f16);
   m.impl("linear_f16_orig_lt", &linear_f16_orig_lt);
   m.impl("linear_f16_orig_lt_cfg", &linear_f16_orig_lt_cfg);

@@ -444,6 +444,227 @@ __global__ __launch_bounds__(Threads, 1) void linear_orig_rows_f16_kernel(
   }
 }
 
+template <int Threads, int OutTile>
+__global__ __launch_bounds__(Threads, 1) void linear_orig_row1_exact_f16_kernel(
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * OutTile;
+  float acc[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = 0.0f;
+  }
+  for (int k2 = threadIdx.x; k2 < (K >> 1); k2 += Threads) {
+    const int k = k2 << 1;
+    const float2 xv = __half22float2(*reinterpret_cast<const __half2*>(x + k));
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weight_orig + static_cast<int64_t>(n0 + j) * K + k));
+      acc[j] = fmaf(xv.x, wv.x, acc[j]);
+      acc[j] = fmaf(xv.y, wv.y, acc[j]);
+    }
+  }
+  __shared__ float partial[Threads / 32][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v = warp_sum(acc[j]);
+    if (lane == 0) {
+      partial[warp][j] = v;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < Threads / 32; ++w) {
+        sum += partial[w][j];
+      }
+      y[n0 + j] = __float2half_rn(sum);
+    }
+  }
+}
+
+template <int Threads, int OutTile>
+__global__ __launch_bounds__(Threads, 1) void linear_orig_row1_exact4_f16_kernel(
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * OutTile;
+  float acc[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = 0.0f;
+  }
+  for (int k = threadIdx.x << 2; k < K; k += Threads << 2) {
+    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(x + k));
+    const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 2));
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const dtype* wj = weight_orig + static_cast<int64_t>(n0 + j) * K + k;
+      const float2 w0 = __half22float2(*reinterpret_cast<const __half2*>(wj));
+      const float2 w1 = __half22float2(*reinterpret_cast<const __half2*>(wj + 2));
+      acc[j] = fmaf(x0.x, w0.x, acc[j]);
+      acc[j] = fmaf(x0.y, w0.y, acc[j]);
+      acc[j] = fmaf(x1.x, w1.x, acc[j]);
+      acc[j] = fmaf(x1.y, w1.y, acc[j]);
+    }
+  }
+  __shared__ float partial[Threads / 32][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v = warp_sum(acc[j]);
+    if (lane == 0) {
+      partial[warp][j] = v;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < Threads / 32; ++w) {
+        sum += partial[w][j];
+      }
+      y[n0 + j] = __float2half_rn(sum);
+    }
+  }
+}
+
+template <int Threads, int OutTile>
+__global__ __launch_bounds__(Threads, 1) void linear_orig_row2_exact_f16_kernel(
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * OutTile;
+  float acc0[OutTile];
+  float acc1[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc0[j] = 0.0f;
+    acc1[j] = 0.0f;
+  }
+  for (int k2 = threadIdx.x; k2 < (K >> 1); k2 += Threads) {
+    const int k = k2 << 1;
+    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(x + k));
+    const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(x + K + k));
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const float2 wv = __half22float2(*reinterpret_cast<const __half2*>(weight_orig + static_cast<int64_t>(n0 + j) * K + k));
+      acc0[j] = fmaf(x0.x, wv.x, acc0[j]);
+      acc0[j] = fmaf(x0.y, wv.y, acc0[j]);
+      acc1[j] = fmaf(x1.x, wv.x, acc1[j]);
+      acc1[j] = fmaf(x1.y, wv.y, acc1[j]);
+    }
+  }
+  __shared__ float partial[Threads / 32][2][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v0 = warp_sum(acc0[j]);
+    const float v1 = warp_sum(acc1[j]);
+    if (lane == 0) {
+      partial[warp][0][j] = v0;
+      partial[warp][1][j] = v1;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      float sum0 = 0.0f;
+      float sum1 = 0.0f;
+#pragma unroll
+      for (int w = 0; w < Threads / 32; ++w) {
+        sum0 += partial[w][0][j];
+        sum1 += partial[w][1][j];
+      }
+      const int n = n0 + j;
+      y[n] = __float2half_rn(sum0);
+      y[N + n] = __float2half_rn(sum1);
+    }
+  }
+}
+
+template <int Threads, int OutTile>
+__global__ __launch_bounds__(Threads, 1) void linear_orig_row2_exact4_f16_kernel(
+    int K,
+    int N,
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ weight_orig,
+    dtype* __restrict__ y) {
+  const int n0 = blockIdx.x * OutTile;
+  float acc0[OutTile];
+  float acc1[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc0[j] = 0.0f;
+    acc1[j] = 0.0f;
+  }
+  for (int k = threadIdx.x << 2; k < K; k += Threads << 2) {
+    const float2 x00 = __half22float2(*reinterpret_cast<const __half2*>(x + k));
+    const float2 x01 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 2));
+    const float2 x10 = __half22float2(*reinterpret_cast<const __half2*>(x + K + k));
+    const float2 x11 = __half22float2(*reinterpret_cast<const __half2*>(x + K + k + 2));
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const dtype* wj = weight_orig + static_cast<int64_t>(n0 + j) * K + k;
+      const float2 w0 = __half22float2(*reinterpret_cast<const __half2*>(wj));
+      const float2 w1 = __half22float2(*reinterpret_cast<const __half2*>(wj + 2));
+      acc0[j] = fmaf(x00.x, w0.x, acc0[j]);
+      acc0[j] = fmaf(x00.y, w0.y, acc0[j]);
+      acc0[j] = fmaf(x01.x, w1.x, acc0[j]);
+      acc0[j] = fmaf(x01.y, w1.y, acc0[j]);
+      acc1[j] = fmaf(x10.x, w0.x, acc1[j]);
+      acc1[j] = fmaf(x10.y, w0.y, acc1[j]);
+      acc1[j] = fmaf(x11.x, w1.x, acc1[j]);
+      acc1[j] = fmaf(x11.y, w1.y, acc1[j]);
+    }
+  }
+  __shared__ float partial[Threads / 32][2][OutTile];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v0 = warp_sum(acc0[j]);
+    const float v1 = warp_sum(acc1[j]);
+    if (lane == 0) {
+      partial[warp][0][j] = v0;
+      partial[warp][1][j] = v1;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      float sum0 = 0.0f;
+      float sum1 = 0.0f;
+#pragma unroll
+      for (int w = 0; w < Threads / 32; ++w) {
+        sum0 += partial[w][0][j];
+        sum1 += partial[w][1][j];
+      }
+      const int n = n0 + j;
+      y[n] = __float2half_rn(sum0);
+      y[N + n] = __float2half_rn(sum1);
+    }
+  }
+}
+
 template <int Threads, int OutTile, int Act>
 __global__ __launch_bounds__(Threads, 2) void linear_t_act_f16_ntile_scalar_kernel(
     int M,
@@ -1969,6 +2190,7 @@ void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
   if (threads == 64 && row_tile == 1 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<64, 1, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<64, 1, 8>(stream, M, K, N, x, weight_orig, y);
   if (threads == 128 && row_tile == 1 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<128, 1, 8>(stream, M, K, N, x, weight_orig, y);
+  if (threads == 256 && row_tile == 1 && out_tile == 1) return linear_orig_rows_cfg_launch_impl<256, 1, 1>(stream, M, K, N, x, weight_orig, y);
   if (threads == 32 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<32, 4, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<64, 4, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 96 && row_tile == 4 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<96, 4, 4>(stream, M, K, N, x, weight_orig, y);
@@ -1977,6 +2199,7 @@ void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
   if (threads == 32 && row_tile == 8 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<32, 8, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 8 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<64, 8, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 32 && row_tile == 2 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<32, 2, 4>(stream, M, K, N, x, weight_orig, y);
+  if (threads == 64 && row_tile == 2 && out_tile == 2) return linear_orig_rows_cfg_launch_impl<64, 2, 2>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 2 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<64, 2, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 32 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<32, 3, 4>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 3 && out_tile == 4) return linear_orig_rows_cfg_launch_impl<64, 3, 4>(stream, M, K, N, x, weight_orig, y);
@@ -1984,6 +2207,50 @@ void rwkv7_v3a_linear_orig_rows_cfg_f16_launch(
   if (threads == 32 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<32, 3, 8>(stream, M, K, N, x, weight_orig, y);
   if (threads == 64 && row_tile == 3 && out_tile == 8) return linear_orig_rows_cfg_launch_impl<64, 3, 8>(stream, M, K, N, x, weight_orig, y);
   assert(false && "unsupported linear_orig_rows_cfg_f16 threads/row_tile/out_tile");
+}
+
+template <int Threads, int OutTile, bool Use4>
+void linear_orig_row1_exact_launch_impl(
+    cudaStream_t stream, int M, int K, int N,
+    const half* x, const half* weight_orig, half* y) {
+  assert(M == 1);
+  assert((N % OutTile) == 0);
+  assert((K % (Use4 ? 4 : 2)) == 0);
+  if constexpr (Use4) {
+    linear_orig_row1_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
+  } else {
+    linear_orig_row1_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
+  }
+}
+
+template <int Threads, int OutTile, bool Use4>
+void linear_orig_row2_exact_launch_impl(
+    cudaStream_t stream, int M, int K, int N,
+    const half* x, const half* weight_orig, half* y) {
+  assert(M == 2);
+  assert((N % OutTile) == 0);
+  assert((K % (Use4 ? 4 : 2)) == 0);
+  if constexpr (Use4) {
+    linear_orig_row2_exact4_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
+  } else {
+    linear_orig_row2_exact_f16_kernel<Threads, OutTile><<<N / OutTile, Threads, 0, stream>>>(K, N, x, weight_orig, y);
+  }
+}
+
+void rwkv7_v3a_linear_orig_rows_exact_f16_launch(
+    cudaStream_t stream, int M, int K, int N,
+    const half* x, const half* weight_orig,
+    int threads, int out_tile, bool use4, half* y) {
+  if (M == 1) {
+    if (!use4 && threads == 128 && out_tile == 2) return linear_orig_row1_exact_launch_impl<128, 2, false>(stream, M, K, N, x, weight_orig, y);
+    if (use4 && threads == 128 && out_tile == 2) return linear_orig_row1_exact_launch_impl<128, 2, true>(stream, M, K, N, x, weight_orig, y);
+  }
+  if (M == 2) {
+    if (use4 && threads == 64 && out_tile == 2) return linear_orig_row2_exact_launch_impl<64, 2, true>(stream, M, K, N, x, weight_orig, y);
+    if (use4 && threads == 256 && out_tile == 1) return linear_orig_row2_exact_launch_impl<256, 1, true>(stream, M, K, N, x, weight_orig, y);
+    if (!use4 && threads == 128 && out_tile == 2) return linear_orig_row2_exact_launch_impl<128, 2, false>(stream, M, K, N, x, weight_orig, y);
+  }
+  assert(false && "unsupported linear_orig_rows_exact_f16 rows/threads/out_tile/use4");
 }
 
 void rwkv7_v3a_linear_t_act_f16_launch(

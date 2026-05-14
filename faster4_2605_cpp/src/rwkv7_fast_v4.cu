@@ -29,6 +29,72 @@ namespace {
 
 using namespace rwkv7_fast_v4;
 
+Case parse_case(int argc, char** argv) {
+  Case c;
+  for (int i = 1; i < argc; ++i) {
+    auto need_value = [&](const char* name) -> char* {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "missing value for %s\n", name);
+        std::exit(2);
+      }
+      return argv[++i];
+    };
+    if (std::strcmp(argv[i], "--B") == 0) {
+      c.B = std::atoi(need_value("--B"));
+    } else if (std::strcmp(argv[i], "--T") == 0) {
+      c.T = std::atoi(need_value("--T"));
+    } else if (std::strcmp(argv[i], "--cases") == 0) {
+      c.cases = need_value("--cases");
+    } else if (std::strcmp(argv[i], "--all-logits") == 0) {
+      c.all_logits = true;
+    } else if (std::strcmp(argv[i], "--wkv32") == 0) {
+      c.wkv32 = true;
+    } else if (std::strcmp(argv[i], "--model") == 0) {
+      c.model_path = need_value("--model");
+    } else if (std::strcmp(argv[i], "--list-weights") == 0) {
+      c.list_weights = true;
+    } else if (std::strcmp(argv[i], "--weight-stats") == 0) {
+      c.weight_stats = true;
+    } else if (std::strcmp(argv[i], "--model-memory-plan") == 0) {
+      c.model_memory_plan = true;
+    } else if (std::strcmp(argv[i], "--model-forward") == 0) {
+      c.model_forward = true;
+    } else if (std::strcmp(argv[i], "--eval-b1t1") == 0) {
+      c.eval_b1t1 = true;
+      c.model_forward = true;
+    } else if (std::strcmp(argv[i], "--eval-b1tn") == 0) {
+      c.eval_b1tn = true;
+      c.all_logits = true;
+      c.model_forward = true;
+    } else if (std::strcmp(argv[i], "--eval-json") == 0) {
+      c.eval_json = need_value("--eval-json");
+    } else if (std::strcmp(argv[i], "--graph-bench") == 0) {
+      c.graph_bench = true;
+    } else if (std::strcmp(argv[i], "--profile-range") == 0) {
+      c.profile_range = true;
+    } else if (std::strcmp(argv[i], "--warmup") == 0) {
+      c.warmup = std::atoi(need_value("--warmup"));
+    } else if (std::strcmp(argv[i], "--iters") == 0) {
+      c.iters = std::atoi(need_value("--iters"));
+    } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
+      std::printf("usage: rwkv7_fast_v4 [--B n] [--T n] [--cases list] [--all-logits] [--wkv32] [--model path --list-weights|--model-memory-plan|--model-forward [--eval-json path] [--eval-b1t1|--eval-b1tn] [--weight-stats]] [--graph-bench] [--profile-range] [--warmup n] [--iters n]\n");
+      std::exit(0);
+    } else {
+      std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
+      std::exit(2);
+    }
+  }
+  if (c.B <= 0 || c.T <= 0) {
+    std::fprintf(stderr, "B and T must be positive\n");
+    std::exit(2);
+  }
+  if (c.warmup < 0 || c.iters <= 0) {
+    std::fprintf(stderr, "warmup must be >=0 and iters must be >0\n");
+    std::exit(2);
+  }
+  return c;
+}
+
 struct RawBf16TensorView {
   const std::uint16_t* data = nullptr;
   std::uint64_t elems = 0;
@@ -408,25 +474,20 @@ void linear_orig_layout_launch(
     std::size_t workspace_bytes,
     half* y) {
   if (path.rows == 1) {
-    const int out_tile = group == LinearGroup::AttC2C ? 4 : 2;
-    rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 1, out_tile, y);
+    if (group == LinearGroup::FfnKey) {
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+    } else {
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, true, y);
+    }
     return;
   }
   if (path.rows == 2) {
     if (group == LinearGroup::AttC2C) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
-    } else {
-      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
-    }
-    return;
-  }
-  if (path.rows == 3) {
-    if (group == LinearGroup::Head) {
-      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     } else if (group == LinearGroup::FfnKey) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 32, 3, 4, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 256, 1, true, y);
     } else {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 3, 4, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     }
     return;
   }
@@ -438,6 +499,20 @@ void linear_orig_layout_launch(
     }
     rwkv7_v3a_linear_f16_orig_lt_cfg_launch(stream, M, K, N, x, weight_orig, workspace, bytes, algo, y);
   };
+  if (path.rows == 3) {
+    if (group == LinearGroup::Head) {
+      rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+    } else if (group == LinearGroup::FfnKey) {
+      lt(0, 0);
+    } else {
+      lt(0, 2);
+    }
+    return;
+  }
+  if (path.rows == 4) {
+    if (group == LinearGroup::FfnKey) return lt(0, 0);
+    if (group == LinearGroup::AttC2C) return lt(0, 2);
+  }
   if (group == LinearGroup::Head) {
     if (path.rows >= 1024) return lt(128, 0);
     if (path.rows >= 512) return lt(0, 2);
@@ -456,32 +531,36 @@ void linear_orig_layout_launch(
     if (path.rows >= 512) return lt(32, 1);
     if (path.rows >= 384) return lt(128, 2);
     if (path.rows >= 256) return lt(128, 0);
-    if (path.rows >= 192) return lt(32, 2);
+    if (path.rows >= 192) return lt(0, 0);
     if (path.rows >= 160) return lt(128, 1);
     if (path.rows >= 128) return lt(128, 0);
     if (path.rows >= 112) {
       rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
       return;
     }
+    if (path.rows >= 96) return lt(0, 5);
     if (path.rows >= 72) return lt(32, 0);
-    if (path.rows >= 64) return lt(128, 2);
-    if (path.rows == 4) {
-      rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
-      return;
-    }
+    if (path.rows >= 48) return lt(32, 6);
+    if (path.rows >= 32) return lt(0, 0);
+    if (path.rows >= 24) return lt(0, 6);
+    if (path.rows >= 12) return lt(0, 0);
+    if (path.rows >= 5) return lt(0, 2);
   } else {
     if (path.rows >= 1024) return lt(0, 0);
     if (path.rows >= 768) return lt(32, 1);
     if (path.rows >= 512) return lt(128, 3);
     if (path.rows >= 384) return lt(32, 0);
     if (path.rows >= 256) return lt(0, 0);
-    if (path.rows >= 192) return lt(0, 3);
+    if (path.rows >= 192) return lt(0, 1);
     if (path.rows >= 160) return lt(0, 2);
     if (path.rows >= 128) return lt(32, 0);
     if (path.rows >= 112) return lt(32, 3);
     if (path.rows >= 96) return lt(32, 1);
     if (path.rows >= 72) return lt(128, 1);
     if (path.rows >= 64) return lt(0, 0);
+    if (path.rows >= 48) return lt(0, 1);
+    if (path.rows >= 12) return lt(0, 0);
+    if (path.rows == 5 || path.rows == 6) return lt(0, 1);
   }
   rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
 }
@@ -585,13 +664,18 @@ void model_forward(const Case& c) {
                  static_cast<std::size_t>(rows) * kFfn +
                  static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * kVocab);
   DeviceBuffer<half> shift;
-  DeviceBuffer<half> wkv_state;
+  DeviceBuffer<half> wkv_state16;
+  DeviceBuffer<float> wkv_state32;
   DeviceBuffer<int> elapsed;
   DeviceBuffer<unsigned char> lt_workspace;
   cudaStream_t stream = nullptr;
   check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create model forward stream");
   shift.resize(shift_elems, "alloc model shift state");
-  wkv_state.resize(state_elems, "alloc model wkv state");
+  if (run.wkv32) {
+    wkv_state32.resize(state_elems, "alloc model wkv32 state");
+  } else {
+    wkv_state16.resize(state_elems, "alloc model wkv16 state");
+  }
   elapsed.resize(B, "alloc elapsed");
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc cublasLt workspace");
 
@@ -661,7 +745,11 @@ void model_forward(const Case& c) {
 
   auto reset_state = [&]() {
     check_cuda(cudaMemsetAsync(shift.p, 0, shift.n * sizeof(half), stream), "zero model shift state");
-    check_cuda(cudaMemsetAsync(wkv_state.p, 0, wkv_state.n * sizeof(half), stream), "zero model wkv state");
+    if (run.wkv32) {
+      check_cuda(cudaMemsetAsync(wkv_state32.p, 0, wkv_state32.n * sizeof(float), stream), "zero model wkv32 state");
+    } else {
+      check_cuda(cudaMemsetAsync(wkv_state16.p, 0, wkv_state16.n * sizeof(half), stream), "zero model wkv16 state");
+    }
     check_cuda(cudaMemsetAsync(elapsed.p, 0, elapsed.n * sizeof(int), stream), "zero elapsed");
   };
 
@@ -685,7 +773,13 @@ void model_forward(const Case& c) {
     }
     half* shift0 = shift.p + static_cast<std::size_t>(layer) * 2 * B * C;
     half* shift1 = shift0 + static_cast<std::size_t>(B) * C;
-    half* state = wkv_state.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    half* state16 = nullptr;
+    float* state32 = nullptr;
+    if (run.wkv32) {
+      state32 = wkv_state32.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    } else {
+      state16 = wkv_state16.p + static_cast<std::size_t>(layer) * B * H * N * N;
+    }
 
     if (pre_mix_ready) {
       pre_mix_ready = false;
@@ -743,11 +837,14 @@ void model_forward(const Case& c) {
       v_use = v_out;
     }
     rwkv7_tmix_kk_a_gate_launch(stream, B, T, C, H, k, hp(w.att_k_k), hp(w.att_a0), a12, hp(w.att_k_a), k2, neg_kk, kka);
-    if (T <= 16) {
-      rwkv7_wkv_fp16_seq_w0_launch(stream, B, T, C, H, state, r, w12, hp(w.att_w0), k2, v_use, neg_kk, kka, y, elapsed.p);
+    if (run.wkv32) {
+      rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
+      rwkv7_wkv_fp32io16_launch(stream, B, T, C, H, 0, state32, r, w_raw, k2, v_use, neg_kk, kka, y);
+    } else if (T <= 16) {
+      rwkv7_wkv_fp16_seq_w0_launch(stream, B, T, C, H, state16, r, w12, hp(w.att_w0), k2, v_use, neg_kk, kka, y, elapsed.p);
     } else {
       rwkv7_add_vec_launch(stream, C, w12, hp(w.att_w0), w_raw, row_elems);
-      rwkv7_wkv_fp16_seq_launch(stream, B, T, C, H, state, r, w_raw, k2, v_use, neg_kk, kka, y, elapsed.p);
+      rwkv7_wkv_fp16_seq_launch(stream, B, T, C, H, state16, r, w_raw, k2, v_use, neg_kk, kka, y, elapsed.p);
     }
     rwkv7_tmix_lnx_rkvres_xg_launch(stream, B, T, C, H, y, r, k2, v_use, hp(w.att_r_k), hp(w.att_ln_x_w), hp(w.att_ln_x_b), g, y2);
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
@@ -894,6 +991,78 @@ void model_forward(const Case& c) {
     continue;
   }
 
+  if (run.eval_b1tn) {
+    if (B != 1 || !run.all_logits) {
+      std::cerr << "error: --eval-b1tn requires --B 1 and all logits\n";
+      std::exit(2);
+    }
+    if (c.eval_json.empty()) {
+      std::cerr << "error: --eval-b1tn requires --eval-json\n";
+      std::exit(2);
+    }
+    const std::vector<int> eval_ids = read_eval_tokens_all(c.eval_json);
+    if (static_cast<int>(eval_ids.size()) < T + 1) {
+      std::cerr << "error: --eval-b1tn requires at least T+1 eval tokens\n";
+      std::exit(2);
+    }
+
+    reset_state();
+    const auto eval_t0 = std::chrono::steady_clock::now();
+    launch_forward();
+    std::vector<half> host_logits(static_cast<std::size_t>(T) * kVocab);
+    check_cuda(cudaMemcpyAsync(host_logits.data(), logits, host_logits.size() * sizeof(half), cudaMemcpyDeviceToHost, stream),
+               "copy eval b1tn logits");
+    check_cuda(cudaStreamSynchronize(stream), "sync eval b1tn");
+
+    std::vector<float> losses;
+    losses.reserve(T);
+    for (int pos = 0; pos < T; ++pos) {
+      const int target = eval_ids[pos + 1];
+      if (target < 0 || target >= kVocab) {
+        std::cerr << "error: eval target out of range at pos " << pos << "\n";
+        std::exit(1);
+      }
+      const half* row = host_logits.data() + static_cast<std::size_t>(pos) * kVocab;
+      float max_logit = -std::numeric_limits<float>::infinity();
+      for (int i = 0; i < kVocab; ++i) {
+        max_logit = std::max(max_logit, __half2float(row[i]));
+      }
+      double sum = 0.0;
+      for (int i = 0; i < kVocab; ++i) {
+        sum += std::exp(double(__half2float(row[i]) - max_logit));
+      }
+      losses.push_back(float(std::log(sum) + double(max_logit) - double(__half2float(row[target]))));
+    }
+    const double time_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - eval_t0).count();
+    std::vector<float> sorted = losses;
+    std::sort(sorted.begin(), sorted.end());
+    auto q = [&](double p) {
+      const double x = p * double(sorted.size() - 1);
+      const std::size_t lo = static_cast<std::size_t>(std::floor(x));
+      const std::size_t hi = std::min<std::size_t>(lo + 1, sorted.size() - 1);
+      const double a = x - double(lo);
+      return float(double(sorted[lo]) * (1.0 - a) + double(sorted[hi]) * a);
+    };
+    double mean = 0.0;
+    for (float v : losses) {
+      mean += double(v);
+    }
+    mean /= double(losses.size());
+    std::cout << std::fixed << std::setprecision(8)
+              << "EVAL label=rwkv7_fast_v4 path=b1tn"
+              << " positions=" << losses.size()
+              << " mean_loss=" << mean
+              << " p90_loss=" << q(0.90)
+              << " p99_loss=" << q(0.99)
+              << " max_loss=" << sorted.back()
+              << " min_loss=" << sorted.front()
+              << " time_s=" << time_s
+              << " tok_s=" << (double(losses.size()) / time_s)
+              << "\n";
+    check_cuda(cudaStreamDestroy(stream), "destroy eval b1tn stream");
+    continue;
+  }
+
   double graph_ms = -1.0;
   if (run.graph_bench) {
     reset_state();
@@ -942,6 +1111,7 @@ void model_forward(const Case& c) {
     check_cuda(cudaStreamSynchronize(stream), "sync model forward");
   }
   std::cout << "bench B" << B << "T" << T
+            << " wkv=" << (run.wkv32 ? "fp32io16" : "fp16")
             << " ms=" << graph_ms
             << " tok_s=" << (graph_ms > 0.0 ? double(rows) * 1000.0 / graph_ms : -1.0)
             << " gpu_mib=" << mib(weights.bytes())

@@ -49,9 +49,11 @@ struct Case {
   bool weight_stats = false;
   bool model_forward = false;
   bool eval_b1t1 = false;
+  bool eval_b1tn = false;
   bool model_memory_plan = false;
   bool graph_bench = false;
   bool profile_range = false;
+  bool wkv32 = false;
   int warmup = 3;
   int iters = 10;
   std::string model_path;
@@ -301,66 +303,6 @@ inline bool lowrank_needs_t_copy_like_v3a(const std::string& name) {
          ends_with(name, "att.a1") || ends_with(name, "att.a2") ||
          ends_with(name, "att.g1") || ends_with(name, "att.g2") ||
          ends_with(name, "att.v1") || ends_with(name, "att.v2");
-}
-
-inline Case parse_case(int argc, char** argv) {
-  Case c;
-  for (int i = 1; i < argc; ++i) {
-    auto need_value = [&](const char* name) -> char* {
-      if (i + 1 >= argc) {
-        std::fprintf(stderr, "missing value for %s\n", name);
-        std::exit(2);
-      }
-      return argv[++i];
-    };
-    if (std::strcmp(argv[i], "--B") == 0) {
-      c.B = std::atoi(need_value("--B"));
-    } else if (std::strcmp(argv[i], "--T") == 0) {
-      c.T = std::atoi(need_value("--T"));
-    } else if (std::strcmp(argv[i], "--all-logits") == 0) {
-      c.all_logits = true;
-    } else if (std::strcmp(argv[i], "--list-weights") == 0) {
-      c.list_weights = true;
-    } else if (std::strcmp(argv[i], "--model-forward") == 0) {
-      c.model_forward = true;
-    } else if (std::strcmp(argv[i], "--eval-b1t1") == 0) {
-      c.eval_b1t1 = true;
-      c.model_forward = true;
-    } else if (std::strcmp(argv[i], "--model-memory-plan") == 0) {
-      c.model_memory_plan = true;
-    } else if (std::strcmp(argv[i], "--graph-bench") == 0) {
-      c.graph_bench = true;
-    } else if (std::strcmp(argv[i], "--profile-range") == 0) {
-      c.profile_range = true;
-    } else if (std::strcmp(argv[i], "--warmup") == 0) {
-      c.warmup = std::atoi(need_value("--warmup"));
-    } else if (std::strcmp(argv[i], "--iters") == 0) {
-      c.iters = std::atoi(need_value("--iters"));
-    } else if (std::strcmp(argv[i], "--weight-stats") == 0) {
-      c.weight_stats = true;
-    } else if (std::strcmp(argv[i], "--model") == 0) {
-      c.model_path = need_value("--model");
-    } else if (std::strcmp(argv[i], "--eval-json") == 0) {
-      c.eval_json = need_value("--eval-json");
-    } else if (std::strcmp(argv[i], "--cases") == 0) {
-      c.cases = need_value("--cases");
-    } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-      std::printf("usage: rwkv7_fast_v4 [--B n] [--T n] [--cases list] [--all-logits] [--eval-b1t1] [--graph-bench --profile-range --warmup n --iters n] [--model path --list-weights|--model-memory-plan|--model-forward [--eval-json path] [--weight-stats]]\n");
-      std::exit(0);
-    } else {
-      std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
-      std::exit(2);
-    }
-  }
-  if (c.B <= 0 || c.T <= 0) {
-    std::fprintf(stderr, "B and T must be positive\n");
-    std::exit(2);
-  }
-  if (c.warmup < 0 || c.iters <= 0) {
-    std::fprintf(stderr, "warmup must be >=0 and iters must be >0\n");
-    std::exit(2);
-  }
-  return c;
 }
 
 inline void list_weights(const Case& c) {
