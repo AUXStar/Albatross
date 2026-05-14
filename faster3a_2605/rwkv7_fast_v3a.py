@@ -20,7 +20,9 @@ WKV_MODE = "fp16"
 EMB_DEVICE = "cpu"
 RKV_MODE = "off"
 CMIX_SPARSE = "no-fc"
+LOWRANK_WEIGHT = "both"
 ORIG_LINEAR_GROUPS = {"att_c2c", "ffn_key", "head"}
+LOWRANK_SUFFIXES = ("att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2", "att.v1", "att.v2")
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
 CMIX_NOFC_MAX_ROWS = 19
@@ -34,7 +36,7 @@ CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
 
 def main() -> None:
-    global WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, ORIG_LINEAR_GROUPS
+    global WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
@@ -48,6 +50,7 @@ def main() -> None:
     parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
     parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off") # auto is slightly faster but consumes lots of VRAM
     parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc") # auto is slightly faster but consumes lots of VRAM
+    parser.add_argument("--lowrank-weight", choices=("orig", "transpose", "both"), default="both") # orig saves VRAM but slows tiny B*T; transpose saves VRAM but slows large B*T
     parser.add_argument("--orig-linear-groups", default="att_c2c,ffn_key,head") # comma list: none, att_c2c, ffn_key, head
     args = parser.parse_args()
 
@@ -55,9 +58,10 @@ def main() -> None:
     EMB_DEVICE = args.emb
     RKV_MODE = args.batched_rkv
     CMIX_SPARSE = args.cmix_sparse
+    LOWRANK_WEIGHT = args.lowrank_weight
     ORIG_LINEAR_GROUPS = parse_orig_linear_groups(args.orig_linear_groups)
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} orig_linear_groups={groups}")
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows<={CMIX_NOFC_MAX_ROWS} row20_t<={CMIX_NOFC_ROW20_MAX_T} nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -123,6 +127,9 @@ def parse_orig_linear_groups(text: str) -> set[str]:
 def use_orig_linear(group: str) -> bool:
     return group in ORIG_LINEAR_GROUPS
 
+def is_lowrank_weight(key: str) -> bool:
+    return key.endswith(LOWRANK_SUFFIXES)
+
 def is_att_c2c_weight(key: str) -> bool:
     return ".att." in key and key.endswith(("receptance.weight", "key.weight", "value.weight", "output.weight"))
 
@@ -178,22 +185,30 @@ class RWKV7:
             if key == "emb.weight" and emb_cpu is not None:
                 continue
             value = z[key].squeeze()
+            is_lowrank = is_lowrank_weight(key)
             if ".ffn.key.weight" in key and CMIX_SPARSE == "auto":
                 z[key + ".fc"] = value.to(device="cuda", dtype=DTYPE).contiguous()
             if (
-                ("key.weight" in key and not is_orig_linear_weight(key))
+                not is_lowrank
+                and (("key.weight" in key and not is_orig_linear_weight(key))
                 or ("value.weight" in key and not is_orig_linear_weight(key))
                 or ("receptance.weight" in key and not is_orig_linear_weight(key))
                 or ("output.weight" in key and not is_orig_linear_weight(key))
-                or ("head.weight" in key and not is_orig_linear_weight(key))
+                or ("head.weight" in key and not is_orig_linear_weight(key)))
             ):
                 value = value.t()
             value = value.to(device="cuda", dtype=DTYPE).contiguous()
-            if key.endswith(("att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2", "att.v1", "att.v2")):
-                z[key + ".t"] = value.t().contiguous()
             if key.endswith("att.r_k"):
                 value = value.flatten().contiguous()
-            z[key] = value
+            if is_lowrank:
+                if LOWRANK_WEIGHT in ("orig", "both"):
+                    z[key] = value
+                else:
+                    del z[key]
+                if LOWRANK_WEIGHT in ("transpose", "both"):
+                    z[key + ".t"] = value.t().contiguous()
+            else:
+                z[key] = value
             parts = key.split(".")
             if parts[0] == "blocks":
                 max_layer = max(max_layer, int(parts[1]))
@@ -336,42 +351,42 @@ class RWKV7:
                 v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
 
         v1 = None
-        if path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
+        if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
             w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), xv.contiguous(),
                 z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"], z[p+"v1.t"])
-        elif path.rows <= LOWRANK_IN_ROWS_T:
+        elif LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_IN_ROWS_T:
             w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"])
         else:
-            w1 = self.linear_rank_in(xw, z[p+"w1"], z[p+"w1.t"], path.rows)
-            a1 = self.linear_rank_in(xa, z[p+"a1"], z[p+"a1.t"], path.rows)
-            g1 = self.linear_rank_in(xg, z[p+"g1"], z[p+"g1.t"], path.rows)
+            w1 = self.linear_rank_in(xw, z.get(p+"w1"), z.get(p+"w1.t"), path.rows)
+            a1 = self.linear_rank_in(xa, z.get(p+"a1"), z.get(p+"a1.t"), path.rows)
+            g1 = self.linear_rank_in(xg, z.get(p+"g1"), z.get(p+"g1.t"), path.rows)
         v_done = False
-        if path.rows <= LOWRANK_OUT_ROWS_T and layer != 0 and v1 is not None:
+        if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0 and v1 is not None:
             w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), v1.contiguous(),
                 z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"], z[p+"v2.t"],
                 v.contiguous(), v_first.contiguous(), z[p+"v0"])
             v_done = True
-        elif path.rows <= LOWRANK_OUT_ROWS_T:
+        elif LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T:
             w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"])
         else:
-            w = self.linear_rank_out_act(w1, z[p+"w2"], z[p+"w2.t"], path.rows, 1)
-            a = self.linear_rank_out(a1, z[p+"a2"], z[p+"a2.t"], path.rows)
-            g = self.linear_rank_out_act(g1, z[p+"g2"], z[p+"g2.t"], path.rows, 2)
+            w = self.linear_rank_out_act(w1, z.get(p+"w2"), z.get(p+"w2.t"), path.rows, 1)
+            a = self.linear_rank_out(a1, z.get(p+"a2"), z.get(p+"a2.t"), path.rows)
+            g = self.linear_rank_out_act(g1, z.get(p+"g2"), z.get(p+"g2.t"), path.rows, 2)
         k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
 
         if layer == 0:
             v_first = v
         elif not v_done:
-            if path.rows <= LOWRANK_OUT_ROWS_T:
+            if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T:
                 if v1 is None:
-                    v1 = self.linear_rank_in(xv, z[p+"v1"], z[p+"v1.t"], path.rows)
+                    v1 = self.linear_rank_in(xv, z.get(p+"v1"), z.get(p+"v1.t"), path.rows)
                 v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(v1.contiguous(), z[p+"v2.t"], v.contiguous(), v_first.contiguous(), z[p+"v0"])
             else:
-                v12 = self.linear_rank_out(self.linear_rank_in(xv, z[p+"v1"], z[p+"v1.t"], path.rows), z[p+"v2"], z[p+"v2.t"], path.rows)
+                v12 = self.linear_rank_out(self.linear_rank_in(xv, z.get(p+"v1"), z.get(p+"v1.t"), path.rows), z.get(p+"v2"), z.get(p+"v2.t"), path.rows)
                 v = ops.tmix_vres_gate(B, T, C, v.contiguous(), v_first.contiguous(), z[p+"v0"], v12.contiguous())
 
         y = torch.empty_like(r)
@@ -416,7 +431,7 @@ class RWKV7:
         return self.linear(k, z[p+"value.weight"])
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        if x.numel() == x.size(-1):
+        if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
         return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
@@ -539,21 +554,27 @@ class RWKV7:
         return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
 
     def linear_rank_in(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int) -> torch.Tensor:
-        if rows <= LOWRANK_IN_ROWS_T:
+        if weight_t is not None and rows <= LOWRANK_IN_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
-        return self.linear(x, weight)
+        return self.linear_lowrank_orig(x, weight) if weight is not None else self.linear_t_orig(x, weight_t)
 
     def linear_rank_out(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int) -> torch.Tensor:
-        if rows <= LOWRANK_OUT_ROWS_T:
+        if weight_t is not None and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
-        return self.linear(x, weight)
+        return self.linear_lowrank_orig(x, weight) if weight is not None else self.linear_t_orig(x, weight_t)
 
     def linear_rank_out_act(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int, act: int) -> torch.Tensor:
-        if rows <= LOWRANK_OUT_ROWS_T:
+        if weight_t is not None and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(x.contiguous(), weight_t, act)
         ops = torch.ops.rwkv7_fast_ops_fp16
         x = ops.act_tanh(x.contiguous()) if act == 1 else ops.act_sigmoid(x.contiguous())
-        return self.linear(x.contiguous(), weight)
+        return self.linear_lowrank_orig(x.contiguous(), weight) if weight is not None else self.linear_t_orig(x, weight_t)
+
+    def linear_lowrank_orig(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
+
+    def linear_t_orig(self, x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+        return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight_t)
 
     def add(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.add_f16(x.contiguous(), y.contiguous())
