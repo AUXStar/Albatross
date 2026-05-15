@@ -2980,7 +2980,7 @@ at::Tensor linear_f16_orig_lt_cfg_cuda(at::Tensor x, at::Tensor weight_orig, int
   check_cublaslt(cublasLtMatmulAlgoGetHeuristic(lt_handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref, static_cast<int>(heuristics.size()), heuristics.data(), &returned),
                  "linear_f16_orig_lt heuristic");
   TORCH_CHECK(returned > 0, "linear_f16_orig_lt found no algorithm");
-  TORCH_CHECK(algo_index < returned, "linear_f16_orig_lt_cfg algo_index=", algo_index, " returned=", returned);
+  const int selected_algo = algo_index < returned ? static_cast<int>(algo_index) : 0;
   const float alpha = 1.0f;
   const float beta = 0.0f;
   check_cublaslt(cublasLtMatmul(
@@ -2996,7 +2996,7 @@ at::Tensor linear_f16_orig_lt_cfg_cuda(at::Tensor x, at::Tensor weight_orig, int
       c_desc,
       y.data_ptr<dtype>(),
       c_desc,
-      &heuristics[algo_index].algo,
+      &heuristics[selected_algo].algo,
       workspace_ptr,
       workspace_size,
       at::cuda::getCurrentCUDAStream()),

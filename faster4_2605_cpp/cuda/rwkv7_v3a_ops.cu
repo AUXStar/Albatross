@@ -2301,10 +2301,11 @@ void rwkv7_v3a_linear_f16_orig_lt_cfg_launch(
   check_cublas(cublasLtMatmulAlgoGetHeuristic(
       handle, op_desc, a_desc, b_desc, c_desc, c_desc, pref,
       64, heuristics, &returned), "linear_f16_orig_lt heuristic");
-  if (returned <= 0 || algo_index < 0 || algo_index >= returned) {
-    fprintf(stderr, "linear_f16_orig_lt invalid algo_index=%d returned=%d\n", algo_index, returned);
+  if (returned <= 0) {
+    fprintf(stderr, "linear_f16_orig_lt found no algorithm\n");
     abort();
   }
+  const int selected_algo = (algo_index >= 0 && algo_index < returned) ? algo_index : 0;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
@@ -2321,7 +2322,7 @@ void rwkv7_v3a_linear_f16_orig_lt_cfg_launch(
       c_desc,
       y,
       c_desc,
-      &heuristics[algo_index].algo,
+      &heuristics[selected_algo].algo,
       workspace,
       workspace_bytes,
       stream),
