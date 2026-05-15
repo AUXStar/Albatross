@@ -25,7 +25,7 @@ ORIG_LINEAR_GROUPS = {"att_c2c", "ffn_key", "head"}
 LOWRANK_SUFFIXES = ("att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2", "att.v1", "att.v2")
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
-CMIX_NOFC_MAX_ROWS = 19
+LOWRANK_FUSED_MIN_C = 1024
 CMIX_NOFC_ROW20_MAX_T = 5
 CMIX_NOFC_T512_MIN_ROWS = 8
 LN1_TMIX_FUSE = True
@@ -36,8 +36,9 @@ CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
 
 def main() -> None:
-    global WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS
+    global MODEL_PATH, WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--cases", default="1x1,1x2,1x4,1x8,1x16,1x32,1x64,1x128,1x256,2x1,4x1,8x1,16x1,32x1,64x1,128x1,256x1,2x2,4x4,8x8,16x16") # try 1x1024 1024x1 32x32 for extreme tps
@@ -54,6 +55,7 @@ def main() -> None:
     parser.add_argument("--orig-linear-groups", default="att_c2c,ffn_key,head") # comma list: none, att_c2c, ffn_key, head
     args = parser.parse_args()
 
+    MODEL_PATH = args.model
     WKV_MODE = args.wkv
     EMB_DEVICE = args.emb
     RKV_MODE = args.batched_rkv
@@ -62,7 +64,7 @@ def main() -> None:
     ORIG_LINEAR_GROUPS = parse_orig_linear_groups(args.orig_linear_groups)
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
     log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups}")
-    log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows<={CMIX_NOFC_MAX_ROWS} row20_t<={CMIX_NOFC_ROW20_MAX_T} nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
+    log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
     load_extensions(WKV_MODE)
     model = RWKV7()
     if args.eval_json:
@@ -97,7 +99,7 @@ def select_path(B: int, T: int) -> PathConfig:
     if CMIX_SPARSE == "off":
         cmix_mode = CMIX_DENSE
     elif CMIX_SPARSE == "no-fc":
-        use_nofc = rows <= CMIX_NOFC_MAX_ROWS or (rows == 20 and T <= CMIX_NOFC_ROW20_MAX_T)
+        use_nofc = rows <= cmix_nofc_max_rows() or (rows == 20 and T <= cmix_nofc_row20_max_t())
         cmix_mode = CMIX_B1T1_NOFC if rows == 1 else (CMIX_ROWS2_NOFC if use_nofc else CMIX_DENSE)
     elif rows == 1:
         cmix_mode = CMIX_B1T1_SPARSE
@@ -115,6 +117,12 @@ def select_path(B: int, T: int) -> PathConfig:
         use_batched_rkv = False
     return PathConfig(rows=rows, use_batched_rkv=use_batched_rkv, cmix_mode=cmix_mode)
 
+def cmix_nofc_max_rows() -> int:
+    return 19
+
+def cmix_nofc_row20_max_t() -> int:
+    return CMIX_NOFC_ROW20_MAX_T
+
 def parse_orig_linear_groups(text: str) -> set[str]:
     groups = {x.strip() for x in text.replace(",", " ").split() if x.strip()}
     if not groups or groups == {"none"}:
@@ -129,6 +137,12 @@ def use_orig_linear(group: str) -> bool:
 
 def is_lowrank_weight(key: str) -> bool:
     return key.endswith(LOWRANK_SUFFIXES)
+
+def can_use_lowrank_fused(rows: int) -> bool:
+    return C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_IN_ROWS_T
+
+def can_use_lowrank_out_fused(rows: int) -> bool:
+    return C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T
 
 def is_att_c2c_weight(key: str) -> bool:
     return ".att." in key and key.endswith(("receptance.weight", "key.weight", "value.weight", "output.weight"))
@@ -173,6 +187,7 @@ class RWKV7:
         C, V = H * N, z["emb.weight"].shape[0]
         assert N == HEAD_SIZE
         log(f"detected model C={C} H={H} N={N} V={V}")
+        log(f"cmix no-fc path: rows<={cmix_nofc_max_rows()} row20_t<={cmix_nofc_row20_max_t()}")
 
         emb_src = z["emb.weight"].squeeze()
         ln0_w_src = z["blocks.0.ln0.weight"].squeeze()
@@ -271,7 +286,7 @@ class RWKV7:
         dev.copy_(host.view(B,T,C), non_blocking=True)
         return dev
 
-    def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False) -> torch.Tensor:
+    def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
         z = self.z
         B, T, _ = x.shape
         v_first = x
@@ -302,7 +317,11 @@ class RWKV7:
                 else:
                     x, xx = self.add_ln(x, xx, z[p_next+"ln1.weight"], z[p_next+"ln1.bias"])
             elif not all_logits:
-                x = self.add_last_ln(x, xx, z["ln_out.weight"], z["ln_out.bias"])
+                if last_indices is not None:
+                    x = self.ln(self.add(x, xx), z["ln_out.weight"], z["ln_out.bias"])
+                    x = x[torch.arange(B, device=x.device), last_indices].contiguous()
+                else:
+                    x = self.add_last_ln(x, xx, z["ln_out.weight"], z["ln_out.bias"])
                 torch.ops.rwkv7_v3a_ops.advance_i32(state[2], T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
                 return self.linear_head(x)
             else:
@@ -322,6 +341,14 @@ class RWKV7:
         path = select_path(B, T)
         x = self.embed(tokens)
         return self.forward_from_x(x, state, path, all_logits=True)
+
+    def forward_last_at(self, tokens: torch.Tensor, state: list[torch.Tensor], last_indices: torch.Tensor) -> torch.Tensor:
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        B, T = tokens.shape
+        path = select_path(B, T)
+        x = self.embed(tokens)
+        return self.forward_from_x(x, state, path, last_indices=last_indices)
 
     def tmix(self, layer: int, x: torch.Tensor, shift_state: torch.Tensor, wkv_state: torch.Tensor, elapsed_t: torch.Tensor, v_first: torch.Tensor, p: str, path: PathConfig, pre_mix=None) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
@@ -351,11 +378,11 @@ class RWKV7:
                 v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
 
         v1 = None
-        if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_IN_ROWS_T and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0:
+        if LOWRANK_WEIGHT != "orig" and can_use_lowrank_fused(path.rows) and can_use_lowrank_out_fused(path.rows) and layer != 0:
             w1, a1, g1, v1 = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), xv.contiguous(),
                 z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"], z[p+"v1.t"])
-        elif LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_IN_ROWS_T:
+        elif LOWRANK_WEIGHT != "orig" and can_use_lowrank_fused(path.rows):
             w1, a1, g1 = torch.ops.rwkv7_v3a_ops.linear_wag_rank_in_f16(
                 xw.contiguous(), xa.contiguous(), xg.contiguous(), z[p+"w1.t"], z[p+"a1.t"], z[p+"g1.t"])
         else:
@@ -363,13 +390,13 @@ class RWKV7:
             a1 = self.linear_rank_in(xa, z.get(p+"a1"), z.get(p+"a1.t"), path.rows)
             g1 = self.linear_rank_in(xg, z.get(p+"g1"), z.get(p+"g1.t"), path.rows)
         v_done = False
-        if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T and layer != 0 and v1 is not None:
+        if LOWRANK_WEIGHT != "orig" and can_use_lowrank_out_fused(path.rows) and layer != 0 and v1 is not None:
             w, a, g, v = torch.ops.rwkv7_v3a_ops.linear_wagv_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), v1.contiguous(),
                 z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"], z[p+"v2.t"],
                 v.contiguous(), v_first.contiguous(), z[p+"v0"])
             v_done = True
-        elif LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T:
+        elif LOWRANK_WEIGHT != "orig" and can_use_lowrank_out_fused(path.rows):
             w, a, g = torch.ops.rwkv7_v3a_ops.linear_wag_rank_out_f16(
                 w1.contiguous(), a1.contiguous(), g1.contiguous(), z[p+"w2.t"], z[p+"a2.t"], z[p+"g2.t"])
         else:
@@ -381,7 +408,7 @@ class RWKV7:
         if layer == 0:
             v_first = v
         elif not v_done:
-            if LOWRANK_WEIGHT != "orig" and path.rows <= LOWRANK_OUT_ROWS_T:
+            if LOWRANK_WEIGHT != "orig" and can_use_lowrank_out_fused(path.rows):
                 if v1 is None:
                     v1 = self.linear_rank_in(xv, z.get(p+"v1"), z.get(p+"v1.t"), path.rows)
                 v = torch.ops.rwkv7_v3a_ops.linear_t_vres_f16(v1.contiguous(), z[p+"v2.t"], v.contiguous(), v_first.contiguous(), z[p+"v0"])
@@ -447,28 +474,102 @@ class RWKV7:
             return self.linear(x, weight)
         if path.rows == 1:
             if group == "ffn_key":
-                return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, False)
-            return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, True)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, True)
+                return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, C <= 1024)
+            return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, group != "att_c2c" or C < 2048)
         if path.rows == 2:
             if group == "att_c2c":
                 return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 64, 2, True)
             if group == "ffn_key":
-                return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 256, 1, True)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, False)
+                if C < 4096:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 64, 2, True)
+                return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, False)
+            if group == "head" and C == 2560:
+                return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 128, 2, False)
             return torch.ops.rwkv7_v3a_ops.linear_orig_rows_exact_f16(x.contiguous(), weight, 64, 2, True)
         if path.rows == 3:
             if group == "head":
+                if C <= 2048:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
                 return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 3, 2)
             if group == "ffn_key":
+                if C <= 1024:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_cfg_f16(x.contiguous(), weight, 64, 3, 4)
+                if C == 2048:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if group == "att_c2c":
+                if C == 768:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 1, 2)
+                if C == 1024:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 2, 2)
+                if C == 2048:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 3, 4)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 3, 2)
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
             return torch.ops.rwkv7_v3a_ops.linear_orig_rows_cfg_f16(x.contiguous(), weight, 64, 3, 4)
         if path.rows == 4:
             if group == "ffn_key":
+                if C <= 1024:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_cfg_f16(x.contiguous(), weight, 64, 2, 4)
+                if C == 2048:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if group == "att_c2c":
+                if C <= 1024:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 2, 2)
+                if C == 2048:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 4, 2)
+                if C == 2560:
+                    return torch.ops.rwkv7_v3a_ops.linear_orig_rows_f16(x.contiguous(), weight, 4, 2)
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
         if group == "head":
+            if C == 768:
+                if 192 <= path.rows < 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 3)
+                if 96 <= path.rows < 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
+            if C == 1024:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                if 192 <= path.rows < 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
+                if 96 <= path.rows < 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
+            if C == 2048:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
+                if 192 <= path.rows < 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 6)
+                if 128 <= path.rows < 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
+                if 96 <= path.rows < 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
+            if C == 2560:
+                if path.rows >= 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
+                if path.rows >= 192:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 5)
+                if path.rows >= 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
+                if path.rows >= 128:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
+                if path.rows >= 96:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 0)
+                if path.rows >= 80:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
+                if path.rows >= 72:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 1)
             if path.rows >= 1024:
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
             if path.rows >= 512:
@@ -492,6 +593,40 @@ class RWKV7:
             if path.rows >= 72:
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
         if group == "att_c2c":
+            if C == 2560 and 17 <= path.rows <= 20:
+                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
+            if C == 768:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 1)
+                if 96 <= path.rows < 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 3)
+            if C == 1024:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
+                if 96 <= path.rows < 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 6)
+            if C == 2048:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 3)
+                if 192 <= path.rows < 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 0)
+                if 96 <= path.rows < 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
+            if C == 2560:
+                if path.rows >= 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 1)
+                if path.rows >= 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
+                if path.rows >= 128:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
+                if path.rows >= 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 3)
+                if path.rows >= 96:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
+                if path.rows >= 72:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 2)
+                if path.rows >= 5:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
             if path.rows >= 1024:
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
             if path.rows >= 768:
@@ -523,6 +658,39 @@ class RWKV7:
             if path.rows >= 5:
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 2)
         if group == "ffn_key":
+            if C == 2560 and 17 <= path.rows <= 20:
+                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
+            if C == 768:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+                if 96 <= path.rows < 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
+            if C == 1024:
+                if 256 <= path.rows < 384:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
+                if 192 <= path.rows < 256:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
+                if 96 <= path.rows < 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 2)
+            if C == 2048 and 128 <= path.rows < 160:
+                return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 3)
+            if C == 2560:
+                if path.rows >= 192:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
+                if path.rows >= 160:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 4)
+                if path.rows >= 128:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 5)
+                if path.rows >= 112:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 4)
+                if path.rows >= 96:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 128, 4)
+                if path.rows >= 80:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 3)
+                if path.rows >= 72:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 32, 4)
+                if path.rows >= 3:
+                    return torch.ops.rwkv7_v3a_ops.linear_f16_orig(x.contiguous(), weight)
             if path.rows >= 1024:
                 return torch.ops.rwkv7_v3a_ops.linear_f16_orig_lt_cfg(x.contiguous(), weight, 0, 0)
             if path.rows >= 768:
@@ -559,12 +727,12 @@ class RWKV7:
         return self.linear_lowrank_orig(x, weight) if weight is not None else self.linear_t_orig(x, weight_t)
 
     def linear_rank_out(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int) -> torch.Tensor:
-        if weight_t is not None and rows <= LOWRANK_OUT_ROWS_T:
+        if weight_t is not None and C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_f16(x.contiguous(), weight_t)
         return self.linear_lowrank_orig(x, weight) if weight is not None else self.linear_t_orig(x, weight_t)
 
     def linear_rank_out_act(self, x: torch.Tensor, weight: torch.Tensor, weight_t: torch.Tensor, rows: int, act: int) -> torch.Tensor:
-        if weight_t is not None and rows <= LOWRANK_OUT_ROWS_T:
+        if weight_t is not None and C >= LOWRANK_FUSED_MIN_C and rows <= LOWRANK_OUT_ROWS_T:
             return torch.ops.rwkv7_v3a_ops.linear_t_act_f16(x.contiguous(), weight_t, act)
         ops = torch.ops.rwkv7_fast_ops_fp16
         x = ops.act_tanh(x.contiguous()) if act == 1 else ops.act_sigmoid(x.contiguous())

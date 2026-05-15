@@ -22,18 +22,20 @@
 
 namespace rwkv7_fast_v4 {
 
-constexpr int kLayers = 32;
-constexpr int kChannels = 4096;
-constexpr int kHeads = 64;
-constexpr int kHeadSize = 64;
-constexpr int kVocab = 65536;
-constexpr int kFfn = 16384;
 constexpr int kLowrankMax = 512;
 constexpr float kLnEps = 1e-5f;
 constexpr int kLowrankInRowsT = 7;
 constexpr int kLowrankOutRowsT = 4;
-constexpr int kCmixNoFcMaxRows = 19;
-constexpr int kCmixNoFcRow20MaxT = 5;
+constexpr int kLowrankFusedMinC = 1024;
+
+struct ModelDims {
+  int layers = 0;
+  int channels = 0;
+  int heads = 0;
+  int head_size = 0;
+  int vocab = 0;
+  int ffn = 0;
+};
 
 enum class CmixMode {
   NoFcOne,
@@ -59,6 +61,7 @@ struct Case {
   std::string model_path;
   std::string eval_json;
   std::string cases;
+  std::string cmix_sparse = "no-fc";
 };
 
 struct PathConfig {
@@ -185,13 +188,21 @@ struct LayerWeights {
   const GpuTensor* ffn_value_w = nullptr;
 };
 
-inline PathConfig select_path(const Case& c) {
+inline int default_cmix_nofc_max_rows(int channels) {
+  if (channels <= 1024) return 4;
+  if (channels == 2048) return 8;
+  return 12;
+}
+
+inline PathConfig select_path(const Case& c, int channels) {
   PathConfig path;
   path.rows = c.B * c.T;
   path.use_batched_rkv = false;
-  if (path.rows == 1) {
+  if (c.cmix_sparse == "off") {
+    path.cmix = CmixMode::Dense;
+  } else if (path.rows == 1) {
     path.cmix = CmixMode::NoFcOne;
-  } else if (path.rows <= kCmixNoFcMaxRows || (path.rows == 20 && c.T <= kCmixNoFcRow20MaxT)) {
+  } else if (path.rows <= default_cmix_nofc_max_rows(channels)) {
     path.cmix = CmixMode::NoFcRows2;
   } else {
     path.cmix = CmixMode::Dense;
@@ -255,6 +266,34 @@ inline void require_result(bool ok, const std::string& message) {
   }
 }
 
+inline ModelDims infer_model_dims(const std::vector<llm_infer::TensorRecord>& records) {
+  ModelDims d;
+  for (const auto& rec : records) {
+    if (rec.name == "emb.weight" && rec.shape.size() == 2) {
+      d.vocab = static_cast<int>(rec.shape[0]);
+      d.channels = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.att.r_k" && rec.shape.size() == 2) {
+      d.heads = static_cast<int>(rec.shape[0]);
+      d.head_size = static_cast<int>(rec.shape[1]);
+    } else if (rec.name == "blocks.0.ffn.key.weight" && rec.shape.size() == 2) {
+      d.ffn = static_cast<int>(rec.shape[0]);
+    }
+    if (rec.name.rfind("blocks.", 0) == 0) {
+      const char* s = rec.name.c_str() + 7;
+      char* end = nullptr;
+      long layer = std::strtol(s, &end, 10);
+      if (end && *end == '.' && layer >= 0) {
+        d.layers = std::max(d.layers, static_cast<int>(layer) + 1);
+      }
+    }
+  }
+  require_result(d.layers > 0 && d.channels > 0 && d.heads > 0 && d.head_size > 0 && d.vocab > 0 && d.ffn > 0,
+                 "could not infer model dimensions");
+  require_result(d.channels == d.heads * d.head_size, "C must equal H*N");
+  require_result(d.head_size == 64, "current kernels require head size 64");
+  return d;
+}
+
 inline bool ends_with(const std::string& s, const char* suffix) {
   const std::size_t n = std::strlen(suffix);
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
@@ -315,37 +354,18 @@ inline void list_weights(const Case& c) {
   auto records = llm_infer::parse_pth_tensor_records(archive.value());
   require_result(records.ok(), records.status().message());
 
-  int layers = 0;
-  int channels = 0;
-  int heads = 0;
-  int head_size = 0;
-  int vocab = 0;
   std::unordered_map<std::string, const llm_infer::TensorRecord*> by_name;
   for (const auto& rec : records.value()) {
     by_name.emplace(rec.name, &rec);
-    if (rec.name == "emb.weight" && rec.shape.size() == 2) {
-      vocab = static_cast<int>(rec.shape[0]);
-      channels = static_cast<int>(rec.shape[1]);
-    } else if (rec.name == "blocks.0.att.r_k" && rec.shape.size() == 2) {
-      heads = static_cast<int>(rec.shape[0]);
-      head_size = static_cast<int>(rec.shape[1]);
-    }
-    if (rec.name.rfind("blocks.", 0) == 0) {
-      const char* s = rec.name.c_str() + 7;
-      char* end = nullptr;
-      long layer = std::strtol(s, &end, 10);
-      if (end && *end == '.' && layer >= 0) {
-        layers = std::max(layers, static_cast<int>(layer) + 1);
-      }
-    }
   }
+  const ModelDims dims = infer_model_dims(records.value());
   std::cout << "weights path=" << c.model_path
             << " tensors=" << records.value().size()
-            << " L=" << layers
-            << " C=" << channels
-            << " H=" << heads
-            << " N=" << head_size
-            << " V=" << vocab
+            << " L=" << dims.layers
+            << " C=" << dims.channels
+            << " H=" << dims.heads
+            << " N=" << dims.head_size
+            << " V=" << dims.vocab
             << "\n";
 
   const char* keys[] = {
@@ -491,6 +511,7 @@ inline void model_memory_plan(const Case& c) {
   require_result(archive.ok(), archive.status().message());
   auto records = llm_infer::parse_pth_tensor_records(archive.value());
   require_result(records.ok(), records.status().message());
+  const ModelDims dims = infer_model_dims(records.value());
 
   std::size_t gpu_base = 0;
   std::size_t gpu_lowrank_t = 0;
@@ -509,6 +530,12 @@ inline void model_memory_plan(const Case& c) {
     }
   }
   std::cout << "model_memory_plan path=" << c.model_path
+            << " L=" << dims.layers
+            << " C=" << dims.channels
+            << " H=" << dims.heads
+            << " N=" << dims.head_size
+            << " V=" << dims.vocab
+            << " F=" << dims.ffn
             << " gpu_base_mib=" << mib(gpu_base)
             << " gpu_extra_t_mib=" << mib(gpu_lowrank_t)
             << " gpu_total_mib=" << mib(gpu_base + gpu_lowrank_t)

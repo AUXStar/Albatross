@@ -1990,6 +1990,182 @@ __global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_small_kern
   }
 }
 
+template <int Threads>
+__global__ __launch_bounds__(Threads, 1) void add_last_layer_norm_f16_generic_kernel(
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    dtype* __restrict__ y,
+    int64_t B,
+    int64_t T,
+    int C,
+    float eps) {
+  const int64_t bidx = blockIdx.x;
+  if (bidx >= B) {
+    return;
+  }
+  const int64_t src = (bidx * T + (T - 1)) * static_cast<int64_t>(C);
+  const int64_t dst = bidx * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + src + c));
+  }
+  sum = block_sum_t<Threads>(sum);
+  const float mean = sum / static_cast<float>(C);
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + src + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + src + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<Threads>(sum_var);
+  const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
+  const int pairs = C >> 1;
+  for (int p = threadIdx.x; p < pairs; p += Threads) {
+    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x + src)[p]);
+    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual + src)[p]);
+    const float sx = xv.x + rv.x;
+    const float sy = xv.y + rv.y;
+    const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
+    const float2 bb = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
+    reinterpret_cast<__half2*>(y + dst)[p] = __floats2half2_rn(
+        (sx - mean) * rstd * w.x + bb.x,
+        (sy - mean) * rstd * w.y + bb.y);
+  }
+}
+
+template <int Threads>
+__global__ __launch_bounds__(Threads, 1) void add_layer_norm_cmix_mix_f16_generic_kernel(
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    const dtype* __restrict__ x_k,
+    dtype* __restrict__ x_out,
+    dtype* __restrict__ mixed,
+    int64_t rows,
+    int C,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int64_t base = row * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+  }
+  sum = block_sum_t<Threads>(sum);
+  const float mean = sum / static_cast<float>(C);
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<Threads>(sum_var);
+  const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
+  const int pairs = C >> 1;
+  const int64_t base2 = base >> 1;
+  for (int p = threadIdx.x; p < pairs; p += Threads) {
+    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
+    const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
+    const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
+    const float2 prev = __half22float2(reinterpret_cast<const __half2*>(shift_state)[base2 + p]);
+    const float2 mix = __half22float2(reinterpret_cast<const __half2*>(x_k)[p]);
+    const float x0 = xv.x + rv.x;
+    const float x1 = xv.y + rv.y;
+    const __half2 y2 = __floats2half2_rn((x0 - mean) * rstd * w.x + b.x, (x1 - mean) * rstd * w.y + b.y);
+    const float2 yv = __half22float2(y2);
+    reinterpret_cast<__half2*>(x_out)[base2 + p] = __floats2half2_rn(x0, x1);
+    reinterpret_cast<__half2*>(mixed)[base2 + p] =
+        __floats2half2_rn(yv.x + (prev.x - yv.x) * mix.x, yv.y + (prev.y - yv.y) * mix.y);
+    reinterpret_cast<__half2*>(shift_state)[base2 + p] = y2;
+  }
+}
+
+template <int Threads>
+__global__ __launch_bounds__(Threads, 1) void add_layer_norm_tmix_mix6_f16_generic_kernel(
+    const dtype* __restrict__ x,
+    const dtype* __restrict__ residual,
+    dtype* __restrict__ shift_state,
+    const dtype* __restrict__ weight,
+    const dtype* __restrict__ bias,
+    const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_w,
+    const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v,
+    const dtype* __restrict__ x_a,
+    const dtype* __restrict__ x_g,
+    dtype* __restrict__ x_out,
+    dtype* __restrict__ out_r,
+    dtype* __restrict__ out_w,
+    dtype* __restrict__ out_k,
+    dtype* __restrict__ out_v,
+    dtype* __restrict__ out_a,
+    dtype* __restrict__ out_g,
+    int64_t rows,
+    int C,
+    float eps) {
+  const int64_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int64_t base = row * static_cast<int64_t>(C);
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    sum += __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+           __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+  }
+  sum = block_sum_t<Threads>(sum);
+  const float mean = sum / static_cast<float>(C);
+  float sum_var = 0.0f;
+  for (int c = threadIdx.x; c < C; c += Threads) {
+    const float v = __half2float(*reinterpret_cast<const __half*>(x + base + c)) +
+                    __half2float(*reinterpret_cast<const __half*>(residual + base + c));
+    const float d = v - mean;
+    sum_var += d * d;
+  }
+  sum_var = block_sum_t<Threads>(sum_var);
+  const float rstd = rsqrtf(sum_var / static_cast<float>(C) + eps);
+  const int pairs = C >> 1;
+  const int64_t base2 = base >> 1;
+  for (int p = threadIdx.x; p < pairs; p += Threads) {
+    const float2 xv = __half22float2(reinterpret_cast<const __half2*>(x)[base2 + p]);
+    const float2 rv = __half22float2(reinterpret_cast<const __half2*>(residual)[base2 + p]);
+    const float2 w = __half22float2(reinterpret_cast<const __half2*>(weight)[p]);
+    const float2 b = __half22float2(reinterpret_cast<const __half2*>(bias)[p]);
+    const float2 prev = __half22float2(reinterpret_cast<const __half2*>(shift_state)[base2 + p]);
+    const float x0 = xv.x + rv.x;
+    const float x1 = xv.y + rv.y;
+    const __half2 y2 = __floats2half2_rn((x0 - mean) * rstd * w.x + b.x, (x1 - mean) * rstd * w.y + b.y);
+    const float2 yv = __half22float2(y2);
+    const float dx0 = prev.x - yv.x;
+    const float dx1 = prev.y - yv.y;
+    const float2 mr = __half22float2(reinterpret_cast<const __half2*>(x_r)[p]);
+    const float2 mw = __half22float2(reinterpret_cast<const __half2*>(x_w)[p]);
+    const float2 mk = __half22float2(reinterpret_cast<const __half2*>(x_k)[p]);
+    const float2 mv = __half22float2(reinterpret_cast<const __half2*>(x_v)[p]);
+    const float2 ma = __half22float2(reinterpret_cast<const __half2*>(x_a)[p]);
+    const float2 mg = __half22float2(reinterpret_cast<const __half2*>(x_g)[p]);
+    reinterpret_cast<__half2*>(x_out)[base2 + p] = __floats2half2_rn(x0, x1);
+    reinterpret_cast<__half2*>(out_r)[base2 + p] = __floats2half2_rn(yv.x + dx0 * mr.x, yv.y + dx1 * mr.y);
+    reinterpret_cast<__half2*>(out_w)[base2 + p] = __floats2half2_rn(yv.x + dx0 * mw.x, yv.y + dx1 * mw.y);
+    reinterpret_cast<__half2*>(out_k)[base2 + p] = __floats2half2_rn(yv.x + dx0 * mk.x, yv.y + dx1 * mk.y);
+    reinterpret_cast<__half2*>(out_v)[base2 + p] = __floats2half2_rn(yv.x + dx0 * mv.x, yv.y + dx1 * mv.y);
+    reinterpret_cast<__half2*>(out_a)[base2 + p] = __floats2half2_rn(yv.x + dx0 * ma.x, yv.y + dx1 * ma.y);
+    reinterpret_cast<__half2*>(out_g)[base2 + p] = __floats2half2_rn(yv.x + dx0 * mg.x, yv.y + dx1 * mg.y);
+    reinterpret_cast<__half2*>(shift_state)[base2 + p] = y2;
+  }
+}
+
 } // namespace
 
 at::Tensor add_f16_cuda(at::Tensor x, at::Tensor y) {
@@ -2154,9 +2330,16 @@ at::Tensor add_last_layer_norm_f16_cuda(at::Tensor x, at::Tensor residual, at::T
   const int64_t B = x.size(0);
   const int64_t T = x.size(1);
   const int64_t C = x.size(2);
-  TORCH_CHECK(C == LN_SMALL_C, "add_last_layer_norm_f16 currently requires C=4096");
+  TORCH_CHECK((C % 2) == 0, "add_last_layer_norm_f16 requires even C");
   auto y = at::empty({B, C}, x.options());
   auto stream = at::cuda::getCurrentCUDAStream();
+  if (C != LN_SMALL_C) {
+    add_last_layer_norm_f16_generic_kernel<LN_THREADS><<<static_cast<int>(B), LN_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(), residual.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
+        y.data_ptr<dtype>(), B, T, static_cast<int>(C), static_cast<float>(eps));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return y;
+  }
   if (B >= 1024) {
     add_last_layer_norm_f16_small_kernel<LN_SMALL512_THREADS, true, true><<<static_cast<int>(B), LN_SMALL512_THREADS, 0, stream>>>(
         x.data_ptr<dtype>(), residual.data_ptr<dtype>(), weight.data_ptr<dtype>(), bias.data_ptr<dtype>(),
@@ -2184,19 +2367,36 @@ std::vector<at::Tensor> add_layer_norm_cmix_mix_f16_cuda(
     double eps) {
   auto x_out = at::empty_like(x);
   auto mixed = at::empty_like(x);
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int64_t C = x.size(-1);
+  TORCH_CHECK((C % 2) == 0, "add_layer_norm_cmix_mix_f16 requires even C");
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
-  add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
-      x.data_ptr<dtype>(),
-      residual.data_ptr<dtype>(),
-      shift_state.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(),
-      bias.data_ptr<dtype>(),
-      x_k.data_ptr<dtype>(),
-      x_out.data_ptr<dtype>(),
-      mixed.data_ptr<dtype>(),
-      rows,
-      static_cast<float>(eps));
+  if (C == LN_SMALL_C) {
+    add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(),
+        rows,
+        static_cast<float>(eps));
+  } else {
+    add_layer_norm_cmix_mix_f16_generic_kernel<LN_THREADS><<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(),
+        rows,
+        static_cast<int>(C),
+        static_cast<float>(eps));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {x_out, mixed};
 }
@@ -2211,19 +2411,36 @@ std::vector<at::Tensor> add_layer_norm_cmix_mix_f16_scalar_stats_cuda(
     double eps) {
   auto x_out = at::empty_like(x);
   auto mixed = at::empty_like(x);
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int64_t C = x.size(-1);
+  TORCH_CHECK((C % 2) == 0, "add_layer_norm_cmix_mix_f16 requires even C");
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
-  add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
-      x.data_ptr<dtype>(),
-      residual.data_ptr<dtype>(),
-      shift_state.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(),
-      bias.data_ptr<dtype>(),
-      x_k.data_ptr<dtype>(),
-      x_out.data_ptr<dtype>(),
-      mixed.data_ptr<dtype>(),
-      rows,
-      static_cast<float>(eps));
+  if (C == LN_SMALL_C) {
+    add_layer_norm_cmix_mix_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(),
+        rows,
+        static_cast<float>(eps));
+  } else {
+    add_layer_norm_cmix_mix_f16_generic_kernel<LN_THREADS><<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        mixed.data_ptr<dtype>(),
+        rows,
+        static_cast<int>(C),
+        static_cast<float>(eps));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {x_out, mixed};
 }
@@ -2248,29 +2465,56 @@ std::vector<at::Tensor> add_layer_norm_tmix_mix6_f16_cuda(
   auto out_v = at::empty_like(x);
   auto out_a = at::empty_like(x);
   auto out_g = at::empty_like(x);
-  const int64_t rows = x.numel() / LN_SMALL_C;
+  const int64_t C = x.size(-1);
+  TORCH_CHECK((C % 2) == 0, "add_layer_norm_tmix_mix6_f16 requires even C");
+  const int64_t rows = x.numel() / C;
   auto stream = at::cuda::getCurrentCUDAStream();
-  add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
-      x.data_ptr<dtype>(),
-      residual.data_ptr<dtype>(),
-      shift_state.data_ptr<dtype>(),
-      weight.data_ptr<dtype>(),
-      bias.data_ptr<dtype>(),
-      x_r.data_ptr<dtype>(),
-      x_w.data_ptr<dtype>(),
-      x_k.data_ptr<dtype>(),
-      x_v.data_ptr<dtype>(),
-      x_a.data_ptr<dtype>(),
-      x_g.data_ptr<dtype>(),
-      x_out.data_ptr<dtype>(),
-      out_r.data_ptr<dtype>(),
-      out_w.data_ptr<dtype>(),
-      out_k.data_ptr<dtype>(),
-      out_v.data_ptr<dtype>(),
-      out_a.data_ptr<dtype>(),
-      out_g.data_ptr<dtype>(),
-      rows,
-      static_cast<float>(eps));
+  if (C == LN_SMALL_C) {
+    add_layer_norm_tmix_mix6_f16_scalar_stats_kernel<LN_SMALL_THREADS><<<static_cast<int>(rows), LN_SMALL_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_r.data_ptr<dtype>(),
+        x_w.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_v.data_ptr<dtype>(),
+        x_a.data_ptr<dtype>(),
+        x_g.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        out_r.data_ptr<dtype>(),
+        out_w.data_ptr<dtype>(),
+        out_k.data_ptr<dtype>(),
+        out_v.data_ptr<dtype>(),
+        out_a.data_ptr<dtype>(),
+        out_g.data_ptr<dtype>(),
+        rows,
+        static_cast<float>(eps));
+  } else {
+    add_layer_norm_tmix_mix6_f16_generic_kernel<LN_THREADS><<<static_cast<int>(rows), LN_THREADS, 0, stream>>>(
+        x.data_ptr<dtype>(),
+        residual.data_ptr<dtype>(),
+        shift_state.data_ptr<dtype>(),
+        weight.data_ptr<dtype>(),
+        bias.data_ptr<dtype>(),
+        x_r.data_ptr<dtype>(),
+        x_w.data_ptr<dtype>(),
+        x_k.data_ptr<dtype>(),
+        x_v.data_ptr<dtype>(),
+        x_a.data_ptr<dtype>(),
+        x_g.data_ptr<dtype>(),
+        x_out.data_ptr<dtype>(),
+        out_r.data_ptr<dtype>(),
+        out_w.data_ptr<dtype>(),
+        out_k.data_ptr<dtype>(),
+        out_v.data_ptr<dtype>(),
+        out_a.data_ptr<dtype>(),
+        out_g.data_ptr<dtype>(),
+        rows,
+        static_cast<int>(C),
+        static_cast<float>(eps));
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {x_out, out_r, out_w, out_k, out_v, out_a, out_g};
 }

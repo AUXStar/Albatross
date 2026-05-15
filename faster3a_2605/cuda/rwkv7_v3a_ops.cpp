@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <vector>
 
+#define RWKV7_LAYER_NORM_EPS_SCHEMA "1e-5"
+
 torch::Tensor layer_norm_f16_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
 torch::Tensor emb_ln0_bf16_to_f16_cuda(torch::Tensor emb, torch::Tensor weight, torch::Tensor bias, double eps);
 torch::Tensor layer_norm_f16_small_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps);
@@ -93,7 +95,6 @@ torch::Tensor emb_ln0_bf16_to_f16(torch::Tensor emb, torch::Tensor weight, torch
   check_bf16_cuda_contig(bias, "bias");
   TORCH_CHECK(emb.dim() == 2, "emb must have shape [V, C]");
   const int64_t c = emb.size(1);
-  TORCH_CHECK(c == 4096, "emb_ln0_bf16_to_f16 currently requires C=4096");
   TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
   TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
   return emb_ln0_bf16_to_f16_cuda(emb, weight, bias, eps);
@@ -436,7 +437,7 @@ std::vector<torch::Tensor> add_layer_norm_cmix_mix_f16(torch::Tensor x, torch::T
   TORCH_CHECK(x.sizes() == residual.sizes(), "add_layer_norm_cmix_mix_f16 x/residual shape mismatch");
   TORCH_CHECK(x.dim() == 3 && x.size(1) == 1, "add_layer_norm_cmix_mix_f16 requires shape [B,1,C]");
   const int64_t c = x.size(2);
-  TORCH_CHECK(c == 4096, "add_layer_norm_cmix_mix_f16 currently requires C=4096");
+  TORCH_CHECK((c % 2) == 0 && c > 0 && c <= 8192, "unsupported C");
   TORCH_CHECK(shift_state.dim() == 2 && shift_state.size(0) == x.size(0) && shift_state.size(1) == c,
               "shift_state shape mismatch");
   TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
@@ -470,13 +471,15 @@ std::vector<torch::Tensor> add_layer_norm_tmix_mix6_f16(
   check_half_cuda_contig(x_a, "x_a");
   check_half_cuda_contig(x_g, "x_g");
   TORCH_CHECK(x.sizes() == residual.sizes(), "add_layer_norm_tmix_mix6_f16 x/residual shape mismatch");
-  TORCH_CHECK(x.dim() == 3 && x.size(1) == 1 && x.size(2) == 4096, "add_layer_norm_tmix_mix6_f16 requires shape [B,1,4096]");
-  TORCH_CHECK(shift_state.dim() == 2 && shift_state.size(0) == x.size(0) && shift_state.size(1) == 4096,
+  TORCH_CHECK(x.dim() == 3 && x.size(1) == 1, "add_layer_norm_tmix_mix6_f16 requires shape [B,1,C]");
+  const int64_t c = x.size(2);
+  TORCH_CHECK((c % 2) == 0 && c > 0 && c <= 8192, "unsupported C");
+  TORCH_CHECK(shift_state.dim() == 2 && shift_state.size(0) == x.size(0) && shift_state.size(1) == c,
               "shift_state shape mismatch");
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == 4096, "weight shape mismatch");
-  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == 4096, "bias shape mismatch");
-  TORCH_CHECK(x_r.numel() == 4096 && x_w.numel() == 4096 && x_k.numel() == 4096 &&
-              x_v.numel() == 4096 && x_a.numel() == 4096 && x_g.numel() == 4096,
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == c, "weight shape mismatch");
+  TORCH_CHECK(bias.dim() == 1 && bias.size(0) == c, "bias shape mismatch");
+  TORCH_CHECK(x_r.numel() == c && x_w.numel() == c && x_k.numel() == c &&
+              x_v.numel() == c && x_a.numel() == c && x_g.numel() == c,
               "mix vector shape mismatch");
   return add_layer_norm_tmix_mix6_f16_cuda(
       x, residual, shift_state, weight, bias, x_r, x_w, x_k, x_v, x_a, x_g, eps);
@@ -602,10 +605,10 @@ void advance_i32(torch::Tensor x, int64_t amount) {
 } // namespace
 
 TORCH_LIBRARY(rwkv7_v3a_ops, m) {
-  m.def("layer_norm_f16(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
-  m.def("emb_ln0_bf16_to_f16(Tensor emb, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
-  m.def("layer_norm_f16_small(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
-  m.def("layer_norm_f16_small512(Tensor x, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
+  m.def("layer_norm_f16(Tensor x, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
+  m.def("emb_ln0_bf16_to_f16(Tensor emb, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
+  m.def("layer_norm_f16_small(Tensor x, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
+  m.def("layer_norm_f16_small512(Tensor x, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
   m.def("linear_f16(Tensor x, Tensor weight) -> Tensor");
   m.def("linear_f16_orig(Tensor x, Tensor weight_orig) -> Tensor");
   m.def("linear_orig_rows_f16(Tensor x, Tensor weight_orig, int row_tile, int out_tile) -> Tensor");
@@ -628,14 +631,14 @@ TORCH_LIBRARY(rwkv7_v3a_ops, m) {
   m.def("linear_wag_rank_out_f16(Tensor w1, Tensor a1, Tensor g1, Tensor w2_t, Tensor a2_t, Tensor g2_t) -> Tensor[]");
   m.def("linear_wagv_rank_out_f16(Tensor w1, Tensor a1, Tensor g1, Tensor v1, Tensor w2_t, Tensor a2_t, Tensor g2_t, Tensor v2_t, Tensor v, Tensor v_first, Tensor v0) -> Tensor[]");
   m.def("add_f16(Tensor x, Tensor y) -> Tensor");
-  m.def("add_layer_norm_f16(Tensor x, Tensor residual, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor[]");
-  m.def("add_last_layer_norm_f16(Tensor x, Tensor residual, Tensor weight, Tensor bias, float eps=1e-5) -> Tensor");
-  m.def("add_layer_norm_cmix_mix_f16(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float eps=1e-5) -> Tensor[]");
-  m.def("add_layer_norm_tmix_mix6_f16(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, float eps=1e-5) -> Tensor[]");
+  m.def("add_layer_norm_f16(Tensor x, Tensor residual, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
+  m.def("add_last_layer_norm_f16(Tensor x, Tensor residual, Tensor weight, Tensor bias, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor");
+  m.def("add_layer_norm_cmix_mix_f16(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
+  m.def("add_layer_norm_tmix_mix6_f16(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
   m.def("add_layer_norm_tmix_mix6_f16_cfg(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, float eps, int threads) -> Tensor[]");
-  m.def("add_layer_norm_tmix_mix6_f16_scalar_stats(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, float eps=1e-5) -> Tensor[]");
+  m.def("add_layer_norm_tmix_mix6_f16_scalar_stats(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_r, Tensor x_w, Tensor x_k, Tensor x_v, Tensor x_a, Tensor x_g, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
   m.def("add_layer_norm_cmix_mix_f16_cfg(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float eps, int threads) -> Tensor[]");
-  m.def("add_layer_norm_cmix_mix_f16_scalar_stats(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float eps=1e-5) -> Tensor[]");
+  m.def("add_layer_norm_cmix_mix_f16_scalar_stats(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, float eps=" RWKV7_LAYER_NORM_EPS_SCHEMA ") -> Tensor[]");
   m.def("advance_i32(Tensor(a!) x, int amount) -> ()");
 }
 

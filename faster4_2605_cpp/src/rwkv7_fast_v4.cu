@@ -49,6 +49,12 @@ Case parse_case(int argc, char** argv) {
       c.all_logits = true;
     } else if (std::strcmp(argv[i], "--wkv32") == 0) {
       c.wkv32 = true;
+    } else if (std::strcmp(argv[i], "--cmix-sparse") == 0) {
+      c.cmix_sparse = need_value("--cmix-sparse");
+      if (c.cmix_sparse != "no-fc" && c.cmix_sparse != "off") {
+        std::fprintf(stderr, "--cmix-sparse must be no-fc or off\n");
+        std::exit(2);
+      }
     } else if (std::strcmp(argv[i], "--model") == 0) {
       c.model_path = need_value("--model");
     } else if (std::strcmp(argv[i], "--list-weights") == 0) {
@@ -77,7 +83,7 @@ Case parse_case(int argc, char** argv) {
     } else if (std::strcmp(argv[i], "--iters") == 0) {
       c.iters = std::atoi(need_value("--iters"));
     } else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-      std::printf("usage: rwkv7_fast_v4 [--B n] [--T n] [--cases list] [--all-logits] [--wkv32] [--model path --list-weights|--model-memory-plan|--model-forward [--eval-json path] [--eval-b1t1|--eval-b1tn] [--weight-stats]] [--graph-bench] [--profile-range] [--warmup n] [--iters n]\n");
+      std::printf("usage: rwkv7_fast_v4 [--B n] [--T n] [--cases list] [--all-logits] [--wkv32] [--cmix-sparse no-fc|off] [--model path --list-weights|--model-memory-plan|--model-forward [--eval-json path] [--eval-b1t1|--eval-b1tn] [--weight-stats]] [--graph-bench] [--profile-range] [--warmup n] [--iters n]\n");
       std::exit(0);
     } else {
       std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
@@ -341,6 +347,7 @@ struct CudaWeights {
 
 void build_cpu_emb_ln0_f16(
     CudaWeights& weights,
+    const ModelDims& dims,
     const llm_infer::PthArchive& archive,
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
   if (weights.layers.empty() || !weights.layers[0].ln0_w || !weights.layers[0].ln0_b) {
@@ -358,8 +365,9 @@ void build_cpu_emb_ln0_f16(
   const RawBf16TensorView emb = raw("emb.weight");
   const RawBf16TensorView ln0_w = raw("blocks.0.ln0.weight");
   const RawBf16TensorView ln0_b = raw("blocks.0.ln0.bias");
-  const std::size_t elems = static_cast<std::size_t>(kVocab) * kChannels;
-  if (emb.elems != elems || ln0_w.elems != kChannels || ln0_b.elems != kChannels) {
+  const std::size_t elems = static_cast<std::size_t>(dims.vocab) * dims.channels;
+  if (emb.elems != elems || ln0_w.elems != static_cast<std::size_t>(dims.channels) ||
+      ln0_b.elems != static_cast<std::size_t>(dims.channels)) {
     std::cerr << "error: emb/ln0 shape mismatch for emb+ln0 preprocessing\n";
     std::exit(1);
   }
@@ -378,7 +386,7 @@ void build_cpu_emb_ln0_f16(
   check_cuda(cudaMemcpy(gpu_ln0_b.p, ln0_b.data, ln0_b.elems * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
              "copy raw bf16 ln0 bias");
   rwkv7_v4_emb_ln0_bf16_to_f16_launch(
-      nullptr, kVocab, kChannels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
+      nullptr, dims.vocab, dims.channels, gpu_emb.p, gpu_ln0_w.p, gpu_ln0_b.p, gpu_out.p, kLnEps);
   check_cuda(cudaGetLastError(), "launch emb+ln0 preprocess");
   weights.cpu_emb_ln0_f16.resize(elems);
   check_cuda(cudaMemcpy(weights.cpu_emb_ln0_f16.data(), gpu_out.p, elems * sizeof(std::uint16_t),
@@ -425,6 +433,7 @@ void load_layer_into(
 }
 
 CudaWeights load_model_weights(
+    const ModelDims& dims,
     const llm_infer::PthArchive& archive,
     const std::unordered_map<std::string, const llm_infer::TensorRecord*>& by_name) {
   CudaWeights weights;
@@ -438,7 +447,7 @@ CudaWeights load_model_weights(
   weights.load(archive, by_name, "head.weight", true, pipeline);
   std::cout << "load_model global done gpu_mib=" << mib(weights.bytes())
             << " cpu_emb_mib=" << mib(weights.cpu_emb_bytes) << "\n";
-  for (int layer = 0; layer < kLayers; ++layer) {
+  for (int layer = 0; layer < dims.layers; ++layer) {
     load_layer_into(weights, archive, by_name, layer, pipeline);
     std::cout << "load_model layer=" << layer
               << " done layers=" << weights.layers.size()
@@ -449,7 +458,7 @@ CudaWeights load_model_weights(
   pipeline.sync();
   check_cuda(cudaDeviceSynchronize(), "sync model weight load");
   weights.build_global_view();
-  build_cpu_emb_ln0_f16(weights, archive, by_name);
+  build_cpu_emb_ln0_f16(weights, dims, archive, by_name);
   std::cout << "load_model emb+ln0 done cpu_emb_mib=" << mib(weights.cpu_emb_bytes)
             << " entries=" << weights.cpu_emb_ln0_f16.size() << "\n";
   return weights;
@@ -475,9 +484,13 @@ void linear_orig_layout_launch(
     half* y) {
   if (path.rows == 1) {
     if (group == LinearGroup::FfnKey) {
-      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, true, y);
+        return;
+      }
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, K <= 1024, y);
     } else {
-      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, true, y);
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, group != LinearGroup::AttC2C || K < 2048, y);
     }
     return;
   }
@@ -485,7 +498,17 @@ void linear_orig_layout_launch(
     if (group == LinearGroup::AttC2C) {
       rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     } else if (group == LinearGroup::FfnKey) {
-      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 256, 1, true, y);
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+        return;
+      }
+      if (K < 4096) {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
+      } else {
+        rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
+      }
+    } else if (group == LinearGroup::Head && K == 2560) {
+      rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 128, 2, false, y);
     } else {
       rwkv7_v3a_linear_orig_rows_exact_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, true, y);
     }
@@ -501,19 +524,106 @@ void linear_orig_layout_launch(
   };
   if (path.rows == 3) {
     if (group == LinearGroup::Head) {
+      if (K <= 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
       rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
     } else if (group == LinearGroup::FfnKey) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 3, 4, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
       lt(0, 0);
     } else {
+      if (K == 768) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 1, 2, y);
+        return;
+      }
+      if (K == 1024) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 4, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 3, 2, y);
+        return;
+      }
       lt(0, 2);
     }
     return;
   }
   if (path.rows == 4) {
-    if (group == LinearGroup::FfnKey) return lt(0, 0);
-    if (group == LinearGroup::AttC2C) return lt(0, 2);
+    if (group == LinearGroup::FfnKey) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_cfg_f16_launch(stream, M, K, N, x, weight_orig, 64, 2, 4, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      return lt(0, 0);
+    }
+    if (group == LinearGroup::AttC2C) {
+      if (K <= 1024) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 2, 2, y);
+        return;
+      }
+      if (K == 2048) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 4, 2, y);
+        return;
+      }
+      if (K == 2560) {
+        rwkv7_v3a_linear_orig_rows_f16_launch(stream, M, K, N, x, weight_orig, 4, 2, y);
+        return;
+      }
+      return lt(0, 2);
+    }
   }
   if (group == LinearGroup::Head) {
+    if (K == 768) {
+      if (path.rows >= 192 && path.rows < 256) return lt(128, 3);
+      if (path.rows >= 96 && path.rows < 160) return lt(0, 1);
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (path.rows >= 192 && path.rows < 256) return lt(0, 2);
+      if (path.rows >= 96 && path.rows < 160) return lt(32, 1);
+    }
+    if (K == 2048) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 0);
+      if (path.rows >= 192 && path.rows < 256) return lt(32, 6);
+      if (path.rows >= 128 && path.rows < 160) return lt(0, 1);
+      if (path.rows >= 96 && path.rows < 112) return lt(0, 0);
+    }
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(0, 1);
+      if (path.rows >= 80) return lt(0, 0);
+      if (path.rows >= 72) return lt(32, 1);
+    }
     if (path.rows >= 1024) return lt(128, 0);
     if (path.rows >= 512) return lt(0, 2);
     if (path.rows >= 384) return lt(128, 2);
@@ -526,6 +636,28 @@ void linear_orig_layout_launch(
     if (path.rows >= 80) return lt(32, 2);
     if (path.rows >= 72) return lt(128, 2);
   } else if (group == LinearGroup::AttC2C) {
+    if (K == 768) {
+      if (path.rows >= 256 && path.rows < 384) return lt(128, 1);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 3);
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) return lt(128, 0);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 6);
+    }
+    if (K == 2048) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 3);
+      if (path.rows >= 192 && path.rows < 256) return lt(128, 0);
+      if (path.rows >= 96 && path.rows < 112) return lt(32, 4);
+    }
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(128, 2);
+      if (path.rows >= 112) return lt(128, 3);
+      if (path.rows >= 72) return lt(128, 2);
+      if (path.rows >= 5) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
     if (path.rows >= 1024) return lt(32, 4);
     if (path.rows >= 768) return lt(32, 0);
     if (path.rows >= 512) return lt(32, 1);
@@ -546,6 +678,32 @@ void linear_orig_layout_launch(
     if (path.rows >= 12) return lt(0, 0);
     if (path.rows >= 5) return lt(0, 2);
   } else {
+    if (K == 768) {
+      if (path.rows >= 256 && path.rows < 384) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+      if (path.rows >= 96 && path.rows < 112) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
+    if (K == 1024) {
+      if (path.rows >= 256 && path.rows < 384) return lt(32, 2);
+      if (path.rows >= 192 && path.rows < 256) return lt(0, 0);
+      if (path.rows >= 96 && path.rows < 160) return lt(32, 2);
+    }
+    if (K == 2048 && path.rows >= 128 && path.rows < 160) return lt(0, 3);
+    if (K == 2560) {
+      if (path.rows >= 128 && path.rows < 160) return lt(32, 5);
+      if (path.rows >= 112) return lt(128, 4);
+      if (path.rows >= 80) return lt(0, 3);
+      if (path.rows >= 72) return lt(32, 4);
+      if (path.rows >= 3) {
+        rwkv7_v3a_linear_f16_orig_launch(stream, M, K, N, x, weight_orig, y);
+        return;
+      }
+    }
     if (path.rows >= 1024) return lt(0, 0);
     if (path.rows >= 768) return lt(32, 1);
     if (path.rows >= 512) return lt(128, 3);
@@ -590,7 +748,7 @@ void linear_rank_out_launch(
     const half* weight,
     const half* weight_t,
     half* y) {
-  if (rows <= kLowrankOutRowsT) {
+  if (rows <= kLowrankOutRowsT && N >= kLowrankFusedMinC) {
     rwkv7_v3a_linear_t_f16_launch(stream, rows, K, N, x, weight_t, y);
   } else {
     rwkv7_v3a_linear_f16_launch(stream, rows, K, N, x, weight, y);
@@ -608,7 +766,7 @@ void linear_rank_out_act_launch(
     int act,
     half* act_scratch,
     half* y) {
-  if (rows <= kLowrankOutRowsT) {
+  if (rows <= kLowrankOutRowsT && N >= kLowrankFusedMinC) {
     rwkv7_v3a_linear_t_act_f16_launch(stream, rows, K, N, x, weight_t, act, y);
     return;
   }
@@ -633,9 +791,10 @@ void model_forward(const Case& c) {
   for (const auto& rec : records.value()) {
     by_name.emplace(rec.name, &rec);
   }
+  const ModelDims dims = infer_model_dims(records.value());
 
   print_cuda_mem("before_model_forward_load");
-  CudaWeights weights = load_model_weights(archive.value(), by_name);
+  CudaWeights weights = load_model_weights(dims, archive.value(), by_name);
   check_cuda(cudaDeviceSynchronize(), "sync model forward weight load");
   print_cuda_mem("after_model_forward_load");
 
@@ -650,19 +809,22 @@ void model_forward(const Case& c) {
     std::cerr << "error: model_forward requires B>=1,T>=1\n";
     std::exit(2);
   }
-  const PathConfig path = select_path(run);
   const int rows = B * T;
   const int output_rows = run.all_logits ? rows : B;
-  constexpr int C = kChannels;
-  constexpr int H = kHeads;
-  constexpr int N = kHeadSize;
-  const std::size_t state_elems = static_cast<std::size_t>(kLayers) * B * H * N * N;
-  const std::size_t shift_elems = static_cast<std::size_t>(kLayers) * 2 * B * C;
+  const int C = dims.channels;
+  const int H = dims.heads;
+  const int N = dims.head_size;
+  const int L = dims.layers;
+  const int V = dims.vocab;
+  const int F = dims.ffn;
+  const PathConfig path = select_path(run, C);
+  const std::size_t state_elems = static_cast<std::size_t>(L) * B * H * N * N;
+  const std::size_t shift_elems = static_cast<std::size_t>(L) * 2 * B * C;
 
   HalfArena arena;
   arena.allocate(static_cast<std::size_t>(rows) * C * 31 + static_cast<std::size_t>(output_rows) * C +
-                 static_cast<std::size_t>(rows) * kFfn +
-                 static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * kVocab);
+                 static_cast<std::size_t>(rows) * F +
+                 static_cast<std::size_t>(rows) * kLowrankMax * 4 + static_cast<std::size_t>(output_rows) * V);
   DeviceBuffer<half> shift;
   DeviceBuffer<half> wkv_state16;
   DeviceBuffer<float> wkv_state32;
@@ -679,7 +841,7 @@ void model_forward(const Case& c) {
   elapsed.resize(B, "alloc elapsed");
   lt_workspace.resize(static_cast<std::size_t>(128) << 20, "alloc cublasLt workspace");
 
-  if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(kVocab) * C) {
+  if (weights.cpu_emb_ln0_f16.size() != static_cast<std::size_t>(V) * C) {
     std::cerr << "error: cpu emb+ln0 table is not ready for model forward\n";
     std::exit(1);
   }
@@ -688,13 +850,13 @@ void model_forward(const Case& c) {
     tokens = read_eval_tokens(c.eval_json, rows);
   } else {
     for (int row = 0; row < rows; ++row) {
-      tokens[row] = static_cast<int>((static_cast<long long>(row) * 1103515245LL + 12345LL) % kVocab);
+      tokens[row] = static_cast<int>((static_cast<long long>(row) * 1103515245LL + 12345LL) % V);
     }
   }
   std::vector<std::uint16_t> host_x(static_cast<std::size_t>(rows) * C);
   for (int row = 0; row < rows; ++row) {
     const int token_id = tokens[row];
-    if (token_id < 0 || token_id >= kVocab) {
+    if (token_id < 0 || token_id >= V) {
       std::cerr << "error: token out of range: " << token_id << "\n";
       std::exit(1);
     }
@@ -735,10 +897,10 @@ void model_forward(const Case& c) {
   half* x_after_att = arena.take(row_elems, "x_after_att");
   half* ln2_out = arena.take(row_elems, "ln2_out");
   half* mixed = arena.take(row_elems, "cmix_mixed");
-  half* hid = arena.take(static_cast<std::size_t>(rows) * kFfn, "ffn_hid");
+  half* hid = arena.take(static_cast<std::size_t>(rows) * F, "ffn_hid");
   half* cmix_out = arena.take(row_elems, "cmix_out");
   half* final_x = arena.take(static_cast<std::size_t>(output_rows) * C, "final_x");
-  half* logits = arena.take(static_cast<std::size_t>(output_rows) * kVocab, "logits");
+  half* logits = arena.take(static_cast<std::size_t>(output_rows) * V, "logits");
 
   check_cuda(cudaMemcpy(x0, host_x.data(), host_x.size() * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
              "copy model emb rows");
@@ -754,14 +916,14 @@ void model_forward(const Case& c) {
   };
 
   auto launch_forward = [&]() {
-    rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, x0, hp(weights.layers[0].ln1_w), hp(weights.layers[0].ln1_b), xx0, 1.0e-5f);
+    rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, x0, hp(weights.layers[0].ln1_w), hp(weights.layers[0].ln1_b), xx0, kLnEps);
     half* x_cur = x0;
     half* xx_cur = xx0;
     half* x_next = x1;
     half* xx_next = xx1;
     bool pre_mix_ready = false;
 
-    for (int layer = 0; layer < kLayers; ++layer) {
+    for (int layer = 0; layer < L; ++layer) {
     const LayerWeights& w = weights.layers[layer];
     const int Rw = static_cast<int>(w.att_w1_t->shape[0]);
     const int Ra = static_cast<int>(w.att_a1_t->shape[0]);
@@ -792,11 +954,11 @@ void model_forward(const Case& c) {
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, xv, hp(w.att_value_w), lt_workspace.p, lt_workspace.n, v_base);
     half* v_use = v_base;
     bool v_done = false;
-    if (rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT && rows <= kLowrankOutRowsT && layer != 0) {
       rwkv7_v3a_linear_wagv_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, xw, xa, xg, xv,
           hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), hp(w.att_v1_t), w1, a1, g1, v1);
-    } else if (rows <= kLowrankInRowsT) {
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wag_rank_in_f16_launch(
           stream, rows, C, Rw, Ra, Rg, xw, xa, xg, hp(w.att_w1_t), hp(w.att_a1_t), hp(w.att_g1_t), w1, a1, g1);
     } else {
@@ -805,14 +967,14 @@ void model_forward(const Case& c) {
       linear_rank_in_launch(stream, rows, C, Rg, xg, hp(w.att_g1), hp(w.att_g1_t), g1);
     }
 
-    if (rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
+    if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT && layer != 0 && rows <= kLowrankInRowsT) {
       rwkv7_v3a_linear_wagv_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, Rv, w1, a1, g1, v1,
           hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), hp(w.att_v2_t),
           v_base, v_first, hp(w.att_v0), w12, a12, g, v_out);
       v_use = v_out;
       v_done = true;
-    } else if (rows <= kLowrankOutRowsT) {
+    } else if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT) {
       rwkv7_v3a_linear_wag_rank_out_f16_launch(
           stream, rows, C, Rw, Ra, Rg, w1, a1, g1, hp(w.att_w2_t), hp(w.att_a2_t), hp(w.att_g2_t), w12, a12, g);
     } else {
@@ -824,7 +986,7 @@ void model_forward(const Case& c) {
     if (layer == 0) {
       check_cuda(cudaMemcpyAsync(v_first, v_base, row_elems * sizeof(half), cudaMemcpyDeviceToDevice, stream), "copy v_first");
     } else if (!v_done) {
-      if (rows <= kLowrankOutRowsT) {
+      if (C >= kLowrankFusedMinC && rows <= kLowrankOutRowsT) {
         if (rows > kLowrankInRowsT) {
           linear_rank_in_launch(stream, rows, C, Rv, xv, hp(w.att_v1), hp(w.att_v1_t), v1);
         }
@@ -850,46 +1012,46 @@ void model_forward(const Case& c) {
     linear_orig_layout_launch(stream, path, LinearGroup::AttC2C, rows, C, C, y2, hp(w.att_output_w), lt_workspace.p, lt_workspace.n, att_out);
     if (T == 1) {
       rwkv7_v3a_add_layer_norm_cmix_mix_f16_launch(
-          stream, rows, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, 1.0e-5f);
+          stream, rows, C, x_cur, att_out, shift1, hp(w.ln2_w), hp(w.ln2_b), hp(w.ffn_x_k), x_after_att, mixed, kLnEps);
     } else {
       rwkv7_v3a_add_layer_norm_f16_launch(
-          stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, 1.0e-5f);
+          stream, rows, C, x_cur, att_out, hp(w.ln2_w), hp(w.ln2_b), x_after_att, ln2_out, kLnEps);
       rwkv7_cmix_mix_launch(stream, B, T, C, ln2_out, shift1, hp(w.ffn_x_k), mixed);
     }
-    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, kFfn, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
+    linear_orig_layout_launch(stream, path, LinearGroup::FfnKey, rows, C, F, mixed, hp(w.ffn_key_w), lt_workspace.p, lt_workspace.n, hid);
     if (path.cmix == CmixMode::NoFcOne) {
-      rwkv7_cmix_sparse_down_relu_one_launch(stream, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+      rwkv7_cmix_sparse_down_relu_one_launch(stream, C, F, hid, hp(w.ffn_value_w), cmix_out);
     } else if (path.cmix == CmixMode::NoFcRows2) {
       if (rows >= 8) {
-        rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+        rwkv7_cmix_sparse_down_relu_rows_t512_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
       } else {
-        rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, kFfn, hid, hp(w.ffn_value_w), cmix_out);
+        rwkv7_cmix_sparse_down_relu_rows_launch(stream, B, T, C, F, hid, hp(w.ffn_value_w), cmix_out);
       }
     } else {
-      rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * kFfn);
-      rwkv7_v3a_linear_f16_launch(stream, rows, kFfn, C, hid, hp(w.ffn_value_w), cmix_out);
+      rwkv7_relu_square_launch(stream, hid, hid, static_cast<long long>(rows) * F);
+      rwkv7_v3a_linear_f16_launch(stream, rows, F, C, hid, hp(w.ffn_value_w), cmix_out);
     }
-    if (layer + 1 < kLayers) {
+    if (layer + 1 < L) {
       const LayerWeights& next = weights.layers[layer + 1];
       if (B == 1 && T == 1) {
         half* next_shift0 = shift.p + static_cast<std::size_t>(layer + 1) * 2 * B * C;
         rwkv7_v3a_add_layer_norm_tmix_mix6_f16_launch(
-            stream, rows, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
+            stream, rows, C, x_after_att, cmix_out, next_shift0, hp(next.ln1_w), hp(next.ln1_b),
             hp(next.att_x_r), hp(next.att_x_w), hp(next.att_x_k), hp(next.att_x_v), hp(next.att_x_a), hp(next.att_x_g),
-            x_next, xr, xw, xk, xv, xa, xg, 1.0e-5f);
+            x_next, xr, xw, xk, xv, xa, xg, kLnEps);
         xx_next = x_next;
         pre_mix_ready = true;
       } else {
-        rwkv7_v3a_add_layer_norm_f16_launch(stream, rows, C, x_after_att, cmix_out, hp(next.ln1_w), hp(next.ln1_b), x_next, xx_next, 1.0e-5f);
+        rwkv7_v3a_add_layer_norm_f16_launch(stream, rows, C, x_after_att, cmix_out, hp(next.ln1_w), hp(next.ln1_b), x_next, xx_next, kLnEps);
       }
       std::swap(x_cur, x_next);
       std::swap(xx_cur, xx_next);
     } else {
       if (run.all_logits) {
         rwkv7_v3a_add_f16_launch(stream, x_after_att, cmix_out, x_next, row_elems);
-        rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, x_next, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
+        rwkv7_v3a_layer_norm_f16_launch(stream, rows, C, x_next, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, kLnEps);
       } else {
-        rwkv7_v3a_add_last_layer_norm_f16_launch(stream, B, T, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, 1.0e-5f);
+        rwkv7_v3a_add_last_layer_norm_f16_launch(stream, B, T, C, x_after_att, cmix_out, hp(weights.ln_out_w), hp(weights.ln_out_b), final_x, kLnEps);
       }
     }
     check_cuda(cudaGetLastError(), "launch model forward layer");
@@ -899,7 +1061,7 @@ void model_forward(const Case& c) {
     head_path.rows = output_rows;
     head_path.use_batched_rkv = false;
     head_path.cmix = CmixMode::Dense;
-    linear_orig_layout_launch(stream, head_path, LinearGroup::Head, output_rows, C, kVocab, final_x, hp(weights.head_w), lt_workspace.p, lt_workspace.n, logits);
+    linear_orig_layout_launch(stream, head_path, LinearGroup::Head, output_rows, C, V, final_x, hp(weights.head_w), lt_workspace.p, lt_workspace.n, logits);
     check_cuda(cudaGetLastError(), "launch model forward head");
   };
 
@@ -931,14 +1093,14 @@ void model_forward(const Case& c) {
     check_cuda(cudaStreamEndCapture(stream, &graph), "end eval b1t1 graph capture");
     check_cuda(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "instantiate eval b1t1 graph");
 
-    std::vector<half> host_logits(kVocab);
+    std::vector<half> host_logits(V);
     std::vector<float> losses;
     losses.reserve(eval_ids.size() - 1);
     const auto eval_t0 = std::chrono::steady_clock::now();
     for (std::size_t pos = 0; pos + 1 < eval_ids.size(); ++pos) {
       const int token_id = eval_ids[pos];
       const int target = eval_ids[pos + 1];
-      if (token_id < 0 || token_id >= kVocab || target < 0 || target >= kVocab) {
+      if (token_id < 0 || token_id >= V || target < 0 || target >= V) {
         std::cerr << "error: eval token out of range at pos " << pos << "\n";
         std::exit(1);
       }
@@ -1009,7 +1171,7 @@ void model_forward(const Case& c) {
     reset_state();
     const auto eval_t0 = std::chrono::steady_clock::now();
     launch_forward();
-    std::vector<half> host_logits(static_cast<std::size_t>(T) * kVocab);
+    std::vector<half> host_logits(static_cast<std::size_t>(T) * V);
     check_cuda(cudaMemcpyAsync(host_logits.data(), logits, host_logits.size() * sizeof(half), cudaMemcpyDeviceToHost, stream),
                "copy eval b1tn logits");
     check_cuda(cudaStreamSynchronize(stream), "sync eval b1tn");
@@ -1018,17 +1180,17 @@ void model_forward(const Case& c) {
     losses.reserve(T);
     for (int pos = 0; pos < T; ++pos) {
       const int target = eval_ids[pos + 1];
-      if (target < 0 || target >= kVocab) {
+      if (target < 0 || target >= V) {
         std::cerr << "error: eval target out of range at pos " << pos << "\n";
         std::exit(1);
       }
-      const half* row = host_logits.data() + static_cast<std::size_t>(pos) * kVocab;
+      const half* row = host_logits.data() + static_cast<std::size_t>(pos) * V;
       float max_logit = -std::numeric_limits<float>::infinity();
-      for (int i = 0; i < kVocab; ++i) {
+      for (int i = 0; i < V; ++i) {
         max_logit = std::max(max_logit, __half2float(row[i]));
       }
       double sum = 0.0;
-      for (int i = 0; i < kVocab; ++i) {
+      for (int i = 0; i < V; ++i) {
         sum += std::exp(double(__half2float(row[i]) - max_logit));
       }
       losses.push_back(float(std::log(sum) + double(max_logit) - double(__half2float(row[target]))));
@@ -1136,8 +1298,6 @@ int main(int argc, char** argv) {
     model_memory_plan(c);
     return 0;
   }
-  std::printf(
-      "rwkv7_fast_v4 B=%d T=%d all_logits=%d L=%d C=%d H=%d N=%d V=%d\n",
-      c.B, c.T, int(c.all_logits), kLayers, kChannels, kHeads, kHeadSize, kVocab);
+  std::printf("rwkv7_fast_v4 B=%d T=%d all_logits=%d\n", c.B, c.T, int(c.all_logits));
   return 0;
 }

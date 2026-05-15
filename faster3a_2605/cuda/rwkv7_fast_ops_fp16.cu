@@ -12,7 +12,8 @@ namespace {
 
 constexpr int HEAD_SIZE = 64;
 constexpr int WARPS_PER_BLOCK = 4;
-constexpr float NORM_EPS = 1.0e-12f;
+constexpr float KK_NORMALIZE_EPS = 1.0e-12f;
+constexpr float TMIX_LN_X_EPS = 64.0e-5f;
 constexpr int FFN_SPMV_THREADS = 128;
 constexpr int FFN_TILE = 128;
 
@@ -202,7 +203,7 @@ __global__ void tmix_kk_a_gate_kernel(
   float sum_sq = u0 * u0 + u1 * u1;
   sum_sq = warp_sum(sum_sq);
   const float total = __shfl_sync(0xffffffffu, sum_sq, 0);
-  const float inv_d = 1.0f / fmaxf(sqrtf(total), NORM_EPS);
+  const float inv_d = 1.0f / fmaxf(sqrtf(total), KK_NORMALIZE_EPS);
   const float kk0 = u0 * inv_d;
   const float kk1 = u1 * inv_d;
 
@@ -264,7 +265,7 @@ __global__ void tmix_lnx_rkvres_xg_kernel(
   }
   __syncthreads();
   const float var = (partial[0] + partial[1]) * (1.0f / 64.0f);
-  const float rstd = rsqrtf(var + 64.0e-5f);
+  const float rstd = rsqrtf(var + TMIX_LN_X_EPS);
   __syncthreads();
 
   const float rv = load_h1(r + idx);
@@ -296,7 +297,7 @@ __global__ void tmix_vres_gate_kernel(
   if (idx >= total) {
     return;
   }
-  const int c = static_cast<int>(idx & (static_cast<int64_t>(C) - 1));
+  const int c = static_cast<int>(idx % static_cast<int64_t>(C));
   const float vv = load_h1(v + idx);
   const float gate = sigmoid_fast(load_h1(v0 + c) + load_h1(v12 + idx));
   store_h1(out + idx, fmaf(load_h1(v_first + idx) - vv, gate, vv));
