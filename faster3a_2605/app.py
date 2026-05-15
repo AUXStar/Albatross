@@ -13,6 +13,8 @@ gpu_h = nvmlDeviceGetHandleByIndex(0)
 
 ctx_limit = 7000
 gen_limit = 1000
+max_bsz = 8
+CHUNK_LEN = 512 # chunk prefill, save VRAM
 
 ########################## text rwkv ################################################################
 
@@ -31,18 +33,33 @@ v3a.load_extensions(v3a.WKV_MODE)
 model = v3a.RWKV7()
 pipeline = PIPELINE(model, "rwkv_vocab_v20230424")
 
-decode_state = model.zero_state(1)
-decode_x = torch.empty((1, 1, v3a.C), device="cuda", dtype=torch.half)
-decode_path = v3a.select_path(1, 1)
-for _ in range(2):
-    model.forward_from_x(decode_x, decode_state, decode_path)
-torch.cuda.synchronize()
-decode_graph = torch.cuda.CUDAGraph()
-with torch.cuda.graph(decode_graph):
-    decode_output = model.forward_from_x(decode_x, decode_state, decode_path)
+decode_cache = {}
 
-def token_to_x(token: int):
-    token_tensor = torch.tensor([[int(token)]], dtype=torch.long, device="cpu" if model.emb_cpu else "cuda")
+def get_decode_ctx(B: int):
+    cached = decode_cache.get(B)
+    if cached is not None:
+        return cached
+    state = model.zero_state(B)
+    x = torch.empty((B, 1, v3a.C), device="cuda", dtype=torch.half)
+    path = v3a.select_path(B, 1)
+    for _ in range(2):
+        model.forward_from_x(x, state, path)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = model.forward_from_x(x, state, path)
+    cached = (state, x, graph, output)
+    decode_cache[B] = cached
+    return cached
+
+def copy_state_to_batch(dst, src):
+    B = dst[2].shape[0]
+    dst[0].copy_(src[0].expand(-1, -1, B, -1))
+    dst[1].copy_(src[1].expand(-1, B, -1, -1, -1))
+    dst[2].copy_(src[2].expand(B))
+
+def tokens_to_x(tokens):
+    token_tensor = torch.tensor(tokens, dtype=torch.long, device="cpu" if model.emb_cpu else "cuda").view(-1, 1)
     return model.embed(token_tensor)
 
 def generate_prompt(instruction, input=""):
@@ -61,6 +78,7 @@ def qa_prompt(instruction):
 def evaluate(
     ctx,
     token_count=200,
+    batch_size=1,
     temperature=1.0,
     top_p=0.5,
     presencePenalty = 2,
@@ -73,56 +91,69 @@ def evaluate(
                      token_ban = [], # ban the generation of some tokens
                      token_stop = [0]) # stop generation whenever you see any token here
     ctx = ctx.strip()
-    all_tokens = []
-    out_last = 0
-    out_str = ''
-    occurrence = {}
+    B = max(1, int(batch_size))
+    all_tokens = [[] for _ in range(B)]
+    out_last = [0 for _ in range(B)]
+    out_str = ['' for _ in range(B)]
+    occurrence = [{} for _ in range(B)]
+    finished = [False for _ in range(B)]
     state = model.zero_state(1)
+    decode_state, decode_x, decode_graph, decode_output = get_decode_ctx(B)
+    next_tokens = [0 for _ in range(B)]
     out = None
     for i in range(int(token_count)):
-        
+
         if i == 0:
             input_ids = pipeline.encode(ctx)[-ctx_limit:]
-            CHUNK_LEN = 512 # chunk prefill, save VRAM
             while len(input_ids) > 0:
                 token_device = "cpu" if model.emb_cpu else "cuda"
                 tokens = torch.tensor(input_ids[:CHUNK_LEN], dtype=torch.long, device=token_device)
                 out = model.forward(tokens, state).view(-1)
                 input_ids = input_ids[CHUNK_LEN:]
-            for dst, src in zip(decode_state, state):
-                dst.copy_(src)
-            logits = out
+            copy_state_to_batch(decode_state, state)
+            logits = out.view(1, -1).expand(B, -1)
         else:
-            decode_x.copy_(token_to_x(token))
+            decode_x.copy_(tokens_to_x(next_tokens))
             decode_graph.replay()
-            logits = decode_output.view(-1)
-                        
-        for n in occurrence:
-            logits[n] -= (args.alpha_presence + occurrence[n] * args.alpha_frequency)
+            logits = decode_output.view(B, -1)
 
-        token = pipeline.sample_logits(logits, temperature=args.temperature, top_p=args.top_p)
-        if token in args.token_stop:
+        active = 0
+        next_tokens = [0 for _ in range(B)]
+        for b in range(B):
+            if finished[b]:
+                continue
+            row = logits[b]
+            for n in occurrence[b]:
+                row[n] -= (args.alpha_presence + occurrence[b][n] * args.alpha_frequency)
+
+            token = pipeline.sample_logits(row, temperature=args.temperature, top_p=args.top_p)
+            if token in args.token_stop:
+                finished[b] = True
+                continue
+            active += 1
+            next_tokens[b] = token
+            all_tokens[b] += [token]
+            for xxx in occurrence[b]:
+                occurrence[b][xxx] *= penalty_decay
+
+            ttt = pipeline.decode([token])
+            www = 1
+            #if ttt in ' \t0123456789':
+            #    www = 0
+            #elif ttt in '\r\n,.;?!"\':+-*/=#@$%^&_`~|<>\\()[]{}，。；“”：？！（）【】':
+            #    www = 0.5
+            if token not in occurrence[b]:
+                occurrence[b][token] = www
+            else:
+                occurrence[b][token] += www
+
+            tmp = pipeline.decode(all_tokens[b][out_last[b]:])
+            if '\ufffd' not in tmp:
+                out_str[b] += tmp
+                out_last[b] = len(all_tokens[b])
+        if active == 0:
             break
-        all_tokens += [token]
-        for xxx in occurrence:
-            occurrence[xxx] *= penalty_decay
-            
-        ttt = pipeline.decode([token])
-        www = 1
-        #if ttt in ' \t0123456789':
-        #    www = 0
-        #elif ttt in '\r\n,.;?!"\':+-*/=#@$%^&_`~|<>\\()[]{}，。；“”：？！（）【】':
-        #    www = 0.5
-        if token not in occurrence:
-            occurrence[token] = www
-        else:
-            occurrence[token] += www
-            
-        tmp = pipeline.decode(all_tokens[out_last:])
-        if '\ufffd' not in tmp:
-            out_str += tmp
-            yield out_str.strip()
-            out_last = i + 1
+        yield out_str[0].strip() if B == 1 else "\n====\n".join(x.strip() for x in out_str)
 
     gpu_info = nvmlDeviceGetMemoryInfo(gpu_h)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -131,7 +162,7 @@ def evaluate(
     del state
     gc.collect()
     torch.cuda.empty_cache()
-    yield out_str.strip()
+    yield out_str[0].strip() if B == 1 else "\n====\n".join(x.strip() for x in out_str)
 
 examples = [
     ["System: Tools:\n- get_weather(location: string, unit?: \"celsius\" | \"fahrenheit\")\n- get_stock_price(ticker: string)\n- translate_text(text: string, target_language: string)\nReturn only a JSON function call.\n\nUser: Translate \"Will it rain tomorrow?\" into Japanese.\n\nAssistant: ```json", 200, 1, 0, 0, 0, 0.99],
@@ -150,6 +181,7 @@ examples = [
     ['''“当然可以，大宇宙不会因为这五公斤就不坍缩了。”关一帆说，他还有一个没说出来的想法：也许大宇宙真的会因为相差一个原子的质量而由封闭转为开放。大自然的精巧有时超出想象，比如生命的诞生，就需要各项宇宙参数在几亿亿分之一精度上的精确配合。但程心仍然可以留下她的生态球，因为在那无数文明创造的无数小宇宙中，肯定有相当一部分不响应回归运动的号召，所以，大宇宙最终被夺走的质量至少有几亿吨，甚至可能是几亿亿亿吨。\n但愿大宇宙能够忽略这个误差。\n程心和关一帆进入了飞船，智子最后也进来了。她早就不再穿那身华丽的和服了，她现在身着迷彩服，再次成为一名轻捷精悍的战士，她的身上佩带着许多武器和生存装备，最引人注目的是那把插在背后的武士刀。\n“放心，我在，你们就在！”智子对两位人类朋友说。\n聚变发动机启动了，推进器发出幽幽的蓝光，''', gen_limit, 1, 0.5, 2, 0.2, 0.99],
     ['''Edward: I am Edward Elric from Fullmetal Alchemist.\n\nUser: Hello Edward. What have you been up to recently?\n\nEdward:''', gen_limit, 1, 0.5, 2, 0.2, 0.99],
 ]
+examples = [[x[0], x[1], 1, *x[2:]] for x in examples]
 
 ##################################################################################################################
 with gr.Blocks(title=title, theme=gr.themes.Base()) as demo:
@@ -161,6 +193,7 @@ with gr.Blocks(title=title, theme=gr.themes.Base()) as demo:
             with gr.Column():
                 prompt = gr.Textbox(lines=6, label="Prompt", value="User: simulate SpaceX mars landing using python\n\nAssistant: <think></think")
                 token_count = gr.Slider(10, gen_limit, label="Max Tokens", step=10, value=gen_limit)
+                batch_size = gr.Slider(1, max_bsz, label="Batch Size", step=1, value=max_bsz)
                 temperature = gr.Slider(0.2, 2.0, label="Temperature", step=0.1, value=1.0)
                 top_p = gr.Slider(0.0, 0.95, label="Top P", step=0.05, value=0.5)
                 presence_penalty = gr.Slider(0.0, 2.0, label="Presence Penalty", step=0.1, value=2)
@@ -171,10 +204,10 @@ with gr.Blocks(title=title, theme=gr.themes.Base()) as demo:
                     submit = gr.Button("Submit", variant="primary")
                     clear = gr.Button("Clear", variant="secondary")
                 output = gr.Textbox(label="Output", lines=20, max_lines=100)
-        data = gr.Dataset(components=[prompt, token_count, temperature, top_p, presence_penalty, count_penalty, penalty_decay], samples=examples, samples_per_page=50, label="Example Instructions", headers=["Prompt", "Max Tokens", "Temperature", "Top P", "Presence Penalty", "Count Penalty", "Penalty Decay"])
-        submit.click(evaluate, [prompt, token_count, temperature, top_p, presence_penalty, count_penalty, penalty_decay], [output])
+        data = gr.Dataset(components=[prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay], samples=examples, samples_per_page=50, label="Example Instructions", headers=["Prompt", "Max Tokens", "Batch Size", "Temperature", "Top P", "Presence Penalty", "Count Penalty", "Penalty Decay"])
+        submit.click(evaluate, [prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay], [output])
         clear.click(lambda: None, [], [output])
-        data.click(lambda x: x, [data], [prompt, token_count, temperature, top_p, presence_penalty, count_penalty, penalty_decay])
+        data.click(lambda x: x, [data], [prompt, token_count, batch_size, temperature, top_p, presence_penalty, count_penalty, penalty_decay])
 
 demo.queue(default_concurrency_limit=1, max_size=10)
 demo.launch(share=False, server_name="0.0.0.0")
