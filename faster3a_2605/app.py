@@ -15,6 +15,7 @@ ctx_limit = 7000
 gen_limit = 1000
 max_bsz = 8
 CHUNK_LEN = 512 # chunk prefill, save VRAM
+SAMPLER_TOP_K = 500
 
 ########################## text rwkv ################################################################
 
@@ -34,6 +35,25 @@ model = v3a.RWKV7()
 pipeline = PIPELINE(model, "rwkv_vocab_v20230424")
 
 decode_cache = {}
+
+@torch.jit.script
+def sample_logits_batch_cuda(logits, temperature: float, top_p: float, k: int):
+    if top_p <= 0.0 or k == 1:
+        return torch.argmax(logits, dim=-1)
+    vals, ids = torch.topk(logits.float(), k=k, dim=-1, sorted=True)
+    if temperature == 1.0:
+        probs = torch.softmax(vals, dim=-1)
+    else:
+        probs = torch.softmax(vals / temperature, dim=-1)
+    cdf = torch.cumsum(probs, dim=-1)
+    if top_p < 1.0:
+        keep = torch.argmax((cdf >= top_p).to(torch.int32), dim=-1)
+        mass = cdf.gather(1, keep.view(-1, 1)).view(-1)
+    else:
+        mass = cdf[:, -1]
+    r = torch.rand((logits.size(0), 1), device=logits.device) * mass.view(-1, 1)
+    out = torch.searchsorted(cdf, r).view(-1, 1)
+    return ids.gather(1, out).view(-1)
 
 def get_decode_ctx(B: int):
     cached = decode_cache.get(B)
@@ -85,13 +105,20 @@ def evaluate(
     countPenalty = 0.2,
     penalty_decay = 0.99,
 ):
-    args = PIPELINE_ARGS(temperature = max(0.2, float(temperature)), top_p = float(top_p),
+    sample_temperature = float(temperature)
+    sample_top_p = float(top_p)
+    if sample_temperature <= 0:
+        sample_temperature = 1.0
+        sample_top_p = 0
+    else:
+        sample_temperature = max(0.2, sample_temperature)
+    args = PIPELINE_ARGS(temperature = sample_temperature, top_p = sample_top_p,
                      alpha_frequency = countPenalty,
                      alpha_presence = presencePenalty,
                      token_ban = [], # ban the generation of some tokens
                      token_stop = [0]) # stop generation whenever you see any token here
     ctx = ctx.strip()
-    B = max(1, int(batch_size))
+    B = min(max_bsz, max(1, int(batch_size)))
     all_tokens = [[] for _ in range(B)]
     out_last = [0 for _ in range(B)]
     out_str = ['' for _ in range(B)]
@@ -105,20 +132,21 @@ def evaluate(
 
         if i == 0:
             input_ids = pipeline.encode(ctx)[-ctx_limit:]
+            if len(input_ids) == 0:
+                yield ""
+                return
             while len(input_ids) > 0:
                 token_device = "cpu" if model.emb_cpu else "cuda"
                 tokens = torch.tensor(input_ids[:CHUNK_LEN], dtype=torch.long, device=token_device)
                 out = model.forward(tokens, state).view(-1)
                 input_ids = input_ids[CHUNK_LEN:]
             copy_state_to_batch(decode_state, state)
-            logits = out.view(1, -1).expand(B, -1)
+            logits = out.view(1, -1).repeat(B, 1)
         else:
             decode_x.copy_(tokens_to_x(next_tokens))
             decode_graph.replay()
             logits = decode_output.view(B, -1)
 
-        active = 0
-        next_tokens = [0 for _ in range(B)]
         for b in range(B):
             if finished[b]:
                 continue
@@ -126,7 +154,19 @@ def evaluate(
             for n in occurrence[b]:
                 row[n] -= (args.alpha_presence + occurrence[b][n] * args.alpha_frequency)
 
-            token = pipeline.sample_logits(row, temperature=args.temperature, top_p=args.top_p)
+        assert logits.is_cuda and logits.dim() == 2
+        sampled = sample_logits_batch_cuda(
+            logits,
+            sample_temperature,
+            sample_top_p,
+            min(SAMPLER_TOP_K, logits.size(-1)),
+        ).detach().cpu().tolist()
+        active = 0
+        next_tokens = [0 for _ in range(B)]
+        for b in range(B):
+            if finished[b]:
+                continue
+            token = sampled[b]
             if token in args.token_stop:
                 finished[b] = True
                 continue
