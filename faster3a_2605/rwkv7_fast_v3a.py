@@ -990,7 +990,15 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         return
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        if x is None:
+            model.forward(tokens, state)
+        else:
+            model.forward_from_x(x, state, path)
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.graph(graph, stream=stream):
         if x is None:
             model.forward(tokens, state)
         else:
