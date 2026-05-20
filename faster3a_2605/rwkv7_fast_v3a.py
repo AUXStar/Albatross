@@ -22,6 +22,7 @@ RKV_MODE = "off"
 CMIX_SPARSE = "no-fc"
 LOWRANK_WEIGHT = "both"
 ORIG_LINEAR_GROUPS = {"att_c2c", "ffn_key", "head"}
+PP_DEVICES: list[int] = []
 LOWRANK_SUFFIXES = ("att.w1", "att.w2", "att.a1", "att.a2", "att.g1", "att.g2", "att.v1", "att.v2")
 LOWRANK_IN_ROWS_T = 7
 LOWRANK_OUT_ROWS_T = 4
@@ -36,7 +37,7 @@ CMIX_ROWS2_NOFC = "rows2_nofc"
 CMIX_DENSE = "dense"
 
 def main() -> None:
-    global MODEL_PATH, WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS
+    global MODEL_PATH, WKV_MODE, EMB_DEVICE, RKV_MODE, CMIX_SPARSE, LOWRANK_WEIGHT, ORIG_LINEAR_GROUPS, PP_DEVICES
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--warmup", type=int, default=1)
@@ -53,6 +54,7 @@ def main() -> None:
     parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc") # auto is slightly faster but consumes lots of VRAM
     parser.add_argument("--lowrank-weight", choices=("orig", "transpose", "both"), default="both") # orig saves VRAM but slows tiny B*T; transpose saves VRAM but slows large B*T
     parser.add_argument("--orig-linear-groups", default="att_c2c,ffn_key,head") # comma list: none, att_c2c, ffn_key, head
+    parser.add_argument("--pp-devices", default="") # comma list, e.g. 0,1. Empty means single GPU.
     args = parser.parse_args()
 
     MODEL_PATH = args.model
@@ -62,8 +64,10 @@ def main() -> None:
     CMIX_SPARSE = args.cmix_sparse
     LOWRANK_WEIGHT = args.lowrank_weight
     ORIG_LINEAR_GROUPS = parse_orig_linear_groups(args.orig_linear_groups)
+    PP_DEVICES = parse_pp_devices(args.pp_devices)
     groups = ",".join(sorted(ORIG_LINEAR_GROUPS)) if ORIG_LINEAR_GROUPS else "none"
-    log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups}")
+    pp = ",".join(str(x) for x in PP_DEVICES) if PP_DEVICES else "off"
+    log(f"start model={MODEL_PATH} wkv={WKV_MODE} emb={EMB_DEVICE} batched_rkv={RKV_MODE} cmix_sparse={CMIX_SPARSE} lowrank_weight={LOWRANK_WEIGHT} orig_linear_groups={groups} pp={pp}")
     log(f"fixed fast path: ln=v3a linear=v3a/splitk lowrank={LOWRANK_IN_ROWS_T}/{LOWRANK_OUT_ROWS_T} nofc_rows=by_C row20_t=by_C nofc_t512_rows>={CMIX_NOFC_T512_MIN_ROWS}")
     load_extensions(WKV_MODE)
     model = RWKV7()
@@ -86,6 +90,62 @@ def cuda_mem() -> str:
     allocated = torch.cuda.memory_allocated()
     reserved = torch.cuda.memory_reserved()
     return f"gpu_mem used={used/2**30:.2f}GiB allocated={allocated/2**30:.2f}GiB reserved={reserved/2**30:.2f}GiB total={total/2**30:.2f}GiB"
+
+def sync_all() -> None:
+    if PP_DEVICES:
+        for dev_id in PP_DEVICES:
+            torch.cuda.synchronize(dev_id)
+    else:
+        torch.cuda.synchronize()
+
+def pp_enabled() -> bool:
+    return len(PP_DEVICES) > 1
+
+def parse_pp_devices(text: str) -> list[int]:
+    if not text.strip():
+        return []
+    out = [int(x) for x in text.replace(",", " ").split()]
+    if len(out) != len(set(out)):
+        raise ValueError(f"duplicate pp devices: {out}")
+    return out
+
+def first_device() -> torch.device:
+    return torch.device(f"cuda:{PP_DEVICES[0]}") if PP_DEVICES else torch.device("cuda")
+
+def last_device() -> torch.device:
+    return torch.device(f"cuda:{PP_DEVICES[-1]}") if PP_DEVICES else torch.device("cuda")
+
+def layer_device_index(layer: int) -> int:
+    if not pp_enabled():
+        return 0
+    return min(len(PP_DEVICES) - 1, layer * len(PP_DEVICES) // L)
+
+def layer_device(layer: int) -> torch.device:
+    return torch.device(f"cuda:{PP_DEVICES[layer_device_index(layer)]}") if PP_DEVICES else torch.device("cuda")
+
+def pp_segments() -> list[tuple[int, int]]:
+    if not pp_enabled():
+        return [(0, L)]
+    out = []
+    start = 0
+    while start < L:
+        idx = layer_device_index(start)
+        end = start + 1
+        while end < L and layer_device_index(end) == idx:
+            end += 1
+        out.append((start, end))
+        start = end
+    return out
+
+def key_device(key: str) -> torch.device:
+    if key == "head.weight" or key.startswith("ln_out."):
+        return last_device()
+    if key == "emb.weight" or key.startswith("blocks.0.ln0."):
+        return first_device()
+    parts = key.split(".")
+    if len(parts) > 2 and parts[0] == "blocks":
+        return layer_device(int(parts[1]))
+    return first_device()
 
 @dataclass(frozen=True)
 class PathConfig:
@@ -186,6 +246,8 @@ class RWKV7:
         H, N = z["blocks.0.att.r_k"].shape
         C, V = H * N, z["emb.weight"].shape[0]
         assert N == HEAD_SIZE
+        max_layer = max(int(k.split(".")[1]) for k in z.keys() if k.startswith("blocks."))
+        L = max_layer + 1
         log(f"detected model C={C} H={H} N={N} V={V}")
         log(f"cmix no-fc path: rows<={cmix_nofc_max_rows()} row20_t<={cmix_nofc_row20_max_t()}")
 
@@ -193,16 +255,16 @@ class RWKV7:
         ln0_w_src = z["blocks.0.ln0.weight"].squeeze()
         ln0_b_src = z["blocks.0.ln0.bias"].squeeze()
         emb_cpu = emb_src if EMB_DEVICE == "cpu" else None
-        max_layer = -1
         t0 = time.perf_counter()
         log(f"moving and preprocessing weights to CUDA emb={EMB_DEVICE}")
         for key in list(z.keys()):
             if key == "emb.weight" and emb_cpu is not None:
                 continue
             value = z[key].squeeze()
+            dev = key_device(key)
             is_lowrank = is_lowrank_weight(key)
             if ".ffn.key.weight" in key and CMIX_SPARSE == "auto":
-                z[key + ".fc"] = value.to(device="cuda", dtype=DTYPE).contiguous()
+                z[key + ".fc"] = value.to(device=dev, dtype=DTYPE).contiguous()
             if (
                 not is_lowrank
                 and (("key.weight" in key and not is_orig_linear_weight(key))
@@ -212,7 +274,7 @@ class RWKV7:
                 or ("head.weight" in key and not is_orig_linear_weight(key)))
             ):
                 value = value.t()
-            value = value.to(device="cuda", dtype=DTYPE).contiguous()
+            value = value.to(device=dev, dtype=DTYPE).contiguous()
             if key.endswith("att.r_k"):
                 value = value.flatten().contiguous()
             if is_lowrank:
@@ -224,23 +286,21 @@ class RWKV7:
                     z[key + ".t"] = value.t().contiguous()
             else:
                 z[key] = value
-            parts = key.split(".")
-            if parts[0] == "blocks":
-                max_layer = max(max_layer, int(parts[1]))
-
-        L = max_layer + 1
-        ln0_w_bf16 = ln0_w_src.to(device="cuda").contiguous()
-        ln0_b_bf16 = ln0_b_src.to(device="cuda").contiguous()
+        emb_dev = first_device()
+        ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
+        ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
         if emb_cpu is None:
-            z["emb.weight"] = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
-                emb_src.to(device="cuda").contiguous(), ln0_w_bf16, ln0_b_bf16)
+            with torch.cuda.device(emb_dev):
+                z["emb.weight"] = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(
+                    emb_src.to(device=emb_dev).contiguous(), ln0_w_bf16, ln0_b_bf16)
         else:
             emb = torch.empty((V,C), dtype=DTYPE, pin_memory=True)
-            for start in range(0, V, 4096):
-                end = min(start + 4096, V)
-                chunk = emb_cpu[start:end].to(device="cuda").contiguous()
-                chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
-                emb[start:end].copy_(chunk)
+            with torch.cuda.device(emb_dev):
+                for start in range(0, V, 4096):
+                    end = min(start + 4096, V)
+                    chunk = emb_cpu[start:end].to(device=emb_dev).contiguous()
+                    chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
+                    emb[start:end].copy_(chunk)
             z["emb.weight"] = emb
         if RKV_MODE != "off" and not use_orig_linear("att_c2c"):
             for layer in range(L):
@@ -249,11 +309,20 @@ class RWKV7:
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        torch.cuda.synchronize()
+        sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
         log(cuda_mem())
 
     def zero_state(self, B: int) -> list[torch.Tensor]:
+        if pp_enabled():
+            shift = []
+            wkv = []
+            for layer in range(L):
+                dev = layer_device(layer)
+                shift.append(torch.zeros((2,B,C), dtype=DTYPE, device=dev))
+                wkv.append(torch.zeros((B,H,N,N), dtype=torch.float32 if WKV_MODE == "fp32io16" else DTYPE, device=dev))
+            elapsed = [torch.zeros((B,), dtype=torch.int32, device=torch.device(f"cuda:{d}")) for d in PP_DEVICES]
+            return [shift, wkv, elapsed]
         return [
             torch.zeros((L,2,B,C), dtype=DTYPE, device="cuda"),
             torch.zeros((L,B,H,N,N), dtype=torch.float32 if WKV_MODE == "fp32io16" else DTYPE, device="cuda"),
@@ -270,6 +339,8 @@ class RWKV7:
 
     def embed(self, tokens: torch.Tensor) -> torch.Tensor:
         if not self.emb_cpu:
+            if tokens.device != self.z["emb.weight"].device:
+                tokens = tokens.to(self.z["emb.weight"].device, non_blocking=True)
             return self.z["emb.weight"][tokens]
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
@@ -277,7 +348,7 @@ class RWKV7:
         host, dev = self.emb_cache.get((B, T), (None, None))
         if host is None:
             host = torch.empty((B*T,C), dtype=DTYPE, pin_memory=True)
-            dev = torch.empty((B,T,C), dtype=DTYPE, device="cuda")
+            dev = torch.empty((B,T,C), dtype=DTYPE, device=first_device())
             self.emb_cache[(B, T)] = (host, dev)
         flat = tokens.reshape(-1)
         if flat.device.type != "cpu":
@@ -287,6 +358,8 @@ class RWKV7:
         return dev
 
     def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
+        if pp_enabled():
+            return self.forward_from_x_pp(x, state, path, all_logits, last_indices)
         z = self.z
         B, T, _ = x.shape
         v_first = x
@@ -330,6 +403,80 @@ class RWKV7:
         x = self.ln(x, z["ln_out.weight"], z["ln_out.bias"])
         torch.ops.rwkv7_v3a_ops.advance_i32(state[2], T) # !!! IMPORTANT FOR WKV16 DITHERING !!!
         return self.linear_head(x)
+
+    def forward_from_x_pp(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
+        B, T, _ = x.shape
+        v_first = None
+        v_first_by_stage: dict[int, torch.Tensor] = {}
+        x = x.to(first_device())
+        segments = pp_segments()
+        for stage, (start, end) in enumerate(segments):
+            dev = layer_device(start)
+            if x.device != dev:
+                x = x.to(dev)
+            with torch.cuda.device(dev):
+                v_in = None if start == 0 else v_first_by_stage[stage]
+                x, v_first = self.forward_pp_segment(x, state, path, start, end, v_in)
+            if start == 0 and v_first is not None:
+                for next_stage, (next_start, _) in enumerate(segments[1:], 1):
+                    next_dev = layer_device(next_start)
+                    v_first_by_stage[next_stage] = v_first if next_dev == v_first.device else v_first.to(next_dev)
+        with torch.cuda.device(last_device()):
+            return self.forward_pp_tail(x, state, T, all_logits, last_indices, advance=True)
+
+    def forward_pp_segment(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, start: int, end: int, v_first: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+        z = self.z
+        B, T, _ = x.shape
+        out_v_first = None
+        xx = self.ln(x, z[f"blocks.{start}.ln1.weight"], z[f"blocks.{start}.ln1.bias"])
+        pre_mix = None
+        for layer in range(start, end):
+            p = f"blocks.{layer}."
+            v_in = x if layer == 0 else v_first
+            xx, v_out = self.tmix(layer, xx, state[0][layer], state[1][layer], state[2][layer_device_index(layer)], v_in, p+"att.", path, pre_mix)
+            pre_mix = None
+            if layer == 0:
+                v_first = v_out
+                out_v_first = v_out
+            if T == 1 and path.cmix_mode not in (CMIX_B1T1_SPARSE, CMIX_ROWS2_SPARSE):
+                x, mixed = torch.ops.rwkv7_v3a_ops.add_layer_norm_cmix_mix_f16(
+                    x.contiguous(), xx.contiguous(), state[0][layer][1], z[p+"ln2.weight"], z[p+"ln2.bias"], z[p+"ffn.x_k"])
+                xx = self.cmix_from_mixed(mixed, p+"ffn.", path)
+            else:
+                x, xx = self.add_ln(x, xx, z[p+"ln2.weight"], z[p+"ln2.bias"])
+                xx = self.cmix(xx, state[0][layer], p+"ffn.", path)
+            if layer + 1 < end:
+                p_next = f"blocks.{layer + 1}."
+                if LN1_TMIX_FUSE and B == 1 and T == 1:
+                    outs = torch.ops.rwkv7_v3a_ops.add_layer_norm_tmix_mix6_f16(
+                        x.contiguous(), xx.contiguous(), state[0][layer + 1][0],
+                        z[p_next+"ln1.weight"], z[p_next+"ln1.bias"],
+                        z[p_next+"att.x_r"], z[p_next+"att.x_w"], z[p_next+"att.x_k"],
+                        z[p_next+"att.x_v"], z[p_next+"att.x_a"], z[p_next+"att.x_g"])
+                    x, pre_mix = outs[0], outs[1:]
+                    xx = x
+                else:
+                    x, xx = self.add_ln(x, xx, z[p_next+"ln1.weight"], z[p_next+"ln1.bias"])
+            else:
+                x = self.add(x, xx)
+        return x, out_v_first
+
+    def forward_pp_tail(self, x: torch.Tensor, state: list[torch.Tensor], T: int, all_logits: bool = False, last_indices=None, advance: bool = True) -> torch.Tensor:
+        B = x.size(0)
+        if not all_logits:
+            if last_indices is None:
+                x = x[:, -1].contiguous()
+            else:
+                x = x[torch.arange(B, device=x.device), last_indices].contiguous()
+        x = self.ln(x, self.z["ln_out.weight"], self.z["ln_out.bias"])
+        if advance:
+            self.advance_pp_elapsed(state, T)
+        return self.linear_head(x)
+
+    def advance_pp_elapsed(self, state: list[torch.Tensor], T: int) -> None:
+        for idx, dev_id in enumerate(PP_DEVICES):
+            with torch.cuda.device(dev_id):
+                torch.ops.rwkv7_v3a_ops.advance_i32(state[2][idx], T)
 
     def ln(self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         return torch.ops.rwkv7_v3a_ops.layer_norm_f16(x.contiguous(), weight, bias)
@@ -759,17 +906,88 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         return float(torch.quantile(torch.tensor(values, dtype=torch.float64), q / 100.0).item())
 
     state = model.zero_state(B)
-    token_device = "cpu" if model.emb_cpu else "cuda"
+    token_device = "cpu" if model.emb_cpu else first_device()
     tokens = torch.arange(B*T, dtype=torch.long, device=token_device).view(B,T)
     tokens = (tokens * 1103515245 + 12345) % V
     path = select_path(B, T)
-    x = model.embed(tokens) if model.emb_cpu else None
+    x = model.embed(tokens) if (model.emb_cpu or pp_enabled()) else None
     for _ in range(warmup):
         if x is None:
             model.forward(tokens, state)
         else:
             model.forward_from_x(x, state, path)
-    torch.cuda.synchronize()
+    sync_all()
+
+    if pp_enabled():
+        segments = pp_segments()
+        stage_inputs = []
+        stage_vfirst = []
+        stage_outputs = []
+        stage_graphs = []
+        v_first_out = None
+        prev = x
+        for stage, (start, end) in enumerate(segments):
+            dev = layer_device(start)
+            with torch.cuda.device(dev):
+                inp = torch.empty((B,T,C), dtype=DTYPE, device=dev)
+                inp.copy_(prev.to(dev))
+                vin = None
+                if start > 0:
+                    vin = torch.empty((B,T,C), dtype=DTYPE, device=dev)
+                    vin.copy_(v_first_out.to(dev))
+                graph = torch.cuda.CUDAGraph()
+                stream = torch.cuda.Stream(device=dev)
+                stream.wait_stream(torch.cuda.current_stream(dev))
+                with torch.cuda.stream(stream):
+                    warm_out, warm_vf = model.forward_pp_segment(inp, state, path, start, end, vin)
+                    if end == L:
+                        model.forward_pp_tail(warm_out, state, T, advance=False)
+                torch.cuda.current_stream(dev).wait_stream(stream)
+                with torch.cuda.graph(graph, stream=stream):
+                    seg_out, vf = model.forward_pp_segment(inp, state, path, start, end, vin)
+                    out = model.forward_pp_tail(seg_out, state, T, advance=False) if end == L else seg_out
+                stage_inputs.append(inp)
+                stage_vfirst.append(vin)
+                stage_outputs.append((out, vf, end == L))
+                stage_graphs.append(graph)
+                prev = seg_out
+                if vf is not None:
+                    v_first_out = vf
+        sync_all()
+
+        times = []
+        if profile_range:
+            torch.cuda.cudart().cudaProfilerStart()
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            with torch.cuda.device(layer_device(segments[0][0])):
+                stage_inputs[0].copy_(x, non_blocking=True)
+            for stage, graph in enumerate(stage_graphs):
+                dev = layer_device(segments[stage][0])
+                with torch.cuda.device(dev):
+                    graph.replay()
+                out, vf, final_stage = stage_outputs[stage]
+                if vf is not None:
+                    v_first_out = vf
+                if not final_stage:
+                    next_start = segments[stage + 1][0]
+                    next_dev = layer_device(next_start)
+                    with torch.cuda.device(next_dev):
+                        stage_inputs[stage + 1].copy_(out, non_blocking=True)
+                        if stage_vfirst[stage + 1] is not None:
+                            stage_vfirst[stage + 1].copy_(v_first_out, non_blocking=True)
+            model.advance_pp_elapsed(state, T)
+            sync_all()
+            times.append((time.perf_counter() - t0) * 1000.0)
+        if profile_range:
+            torch.cuda.cudart().cudaProfilerStop()
+        p10 = percentile(times, 10)
+        p50 = percentile(times, 50)
+        p90 = percentile(times, 90)
+        tok_s = B*T*1000.0 / p50
+        print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
+        print(f"csv,rwkv7_fast_v3a_pp,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+        return
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -806,10 +1024,10 @@ def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths
     ids = data["tokens"]
     outputs = {}
     for path in paths.replace(",", " ").split():
-        token_device = "cpu" if model.emb_cpu else "cuda"
-        targets = torch.tensor(ids[1:], dtype=torch.long, device="cuda")
+        token_device = "cpu" if model.emb_cpu else first_device()
+        targets = torch.tensor(ids[1:], dtype=torch.long, device=last_device() if pp_enabled() else "cuda")
         state = model.zero_state(1)
-        torch.cuda.synchronize()
+        sync_all()
         t0 = time.perf_counter()
         if path == "b1tn":
             tokens = torch.tensor(ids[:-1], dtype=torch.long, device=token_device).view(1, -1)
@@ -825,7 +1043,7 @@ def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths
             logits = None
         else:
             raise ValueError(f"unknown eval path: {path}")
-        torch.cuda.synchronize()
+        sync_all()
         dt = time.perf_counter() - t0
         loss_cpu = loss.detach().cpu()
         p90 = torch.quantile(loss_cpu.float(), 0.90).item()
