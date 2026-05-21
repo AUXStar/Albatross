@@ -23,6 +23,12 @@ D. <|D|>
 
 Assistant: The answer is"""
 CHOICES = [" A", " B", " C", " D"]
+WKV = "fp32io16"
+EMB = "cpu"
+BATCHED_RKV = "off"
+CMIX_SPARSE = "no-fc"
+LOWRANK_WEIGHT = "both"
+ORIG_LINEAR_GROUPS = "att_c2c,ffn_key,head"
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -35,22 +41,16 @@ def main() -> None:
     parser.add_argument("--shuffle-choices", action="store_true")
     parser.add_argument("--no-sort", action="store_true")
     parser.add_argument("--out", default="")
-    parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp32io16")
-    parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu")
-    parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off")
-    parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc")
-    parser.add_argument("--lowrank-weight", choices=("orig", "transpose", "both"), default="both")
-    parser.add_argument("--orig-linear-groups", default="att_c2c,ffn_key,head")
     args = parser.parse_args()
 
     random.seed(args.seed)
     v3a.MODEL_PATH = args.model
-    v3a.WKV_MODE = args.wkv
-    v3a.EMB_DEVICE = args.emb
-    v3a.RKV_MODE = args.batched_rkv
-    v3a.CMIX_SPARSE = args.cmix_sparse
-    v3a.LOWRANK_WEIGHT = args.lowrank_weight
-    v3a.ORIG_LINEAR_GROUPS = v3a.parse_orig_linear_groups(args.orig_linear_groups)
+    v3a.WKV_MODE = WKV
+    v3a.EMB_DEVICE = EMB
+    v3a.RKV_MODE = BATCHED_RKV
+    v3a.CMIX_SPARSE = CMIX_SPARSE
+    v3a.LOWRANK_WEIGHT = LOWRANK_WEIGHT
+    v3a.ORIG_LINEAR_GROUPS = v3a.parse_orig_linear_groups(ORIG_LINEAR_GROUPS)
     v3a.load_extensions(v3a.WKV_MODE)
     model = v3a.RWKV7()
     tokenizer = PIPELINE(model, "rwkv_vocab_v20230424")

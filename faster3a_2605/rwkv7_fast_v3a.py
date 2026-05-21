@@ -48,7 +48,7 @@ def main() -> None:
     parser.add_argument("--eval-out", default="")
     parser.add_argument("--eval-all-logits-out", default="")
     parser.add_argument("--eval-paths", default="b1tn")
-    parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp32io16 is more accurate
+    parser.add_argument("--wkv", choices=("fp16", "fp32io16"), default="fp16") # fp16 is faster at large bsz, fp32io16 is more accurate
     parser.add_argument("--emb", choices=("gpu", "cpu"), default="cpu") # cpu is fast too, and saves VRAM
     parser.add_argument("--batched-rkv", choices=("auto", "on", "off"), default="off") # auto is slightly faster but consumes lots of VRAM
     parser.add_argument("--cmix-sparse", choices=("auto", "no-fc", "off"), default="no-fc") # auto is slightly faster but consumes lots of VRAM
