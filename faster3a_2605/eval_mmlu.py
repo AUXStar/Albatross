@@ -27,7 +27,7 @@ CHOICES = [" A", " B", " C", " D"]
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=v3a.MODEL_PATH)
-    parser.add_argument("--dataset", default=str(THIS_DIR / "mmlu_test_dataset"))
+    parser.add_argument("--dataset", default=str(THIS_DIR / "dataset" / "mmlu_test_dataset"))
     parser.add_argument("--split", default="test")
     parser.add_argument("--bsz", type=int, default=256)
     parser.add_argument("--limit", type=int, default=0)
