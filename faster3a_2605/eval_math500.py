@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=1500)
     parser.add_argument("--ctx-limit", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.55)
-    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-p", type=float, default=0.28)
+    parser.add_argument("--top-k", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--prompt-style",

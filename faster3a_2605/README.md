@@ -13,4 +13,6 @@ python3 eval_mmlu.py --model /dev/shm/rwkv7-g1d-0.4b-20260210-ctx8192.pth --bsz 
 python3 eval_mmlu.py --model /dev/shm/rwkv7-g1f-1.5b-20260419-ctx8192.pth --bsz 256
 python3 eval_mmlu.py --model /dev/shm/rwkv7-g1f-2.9b-20260420-ctx8192.pth --bsz 256
 python3 eval_mmlu.py --model /dev/shm/rwkv7-g1f-13.3b-20260415-ctx8192.pth --bsz 256
+
+python3 eval_math500.py --model /dev/shm/rwkv7-g1f-1.5b-20260419-ctx8192.pth --bsz 960 --gpus 0,1,2,3 --rollout 16
 ```
