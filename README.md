@@ -1,16 +1,4 @@
-# Albatross
-
-efficient RWKV inference engine
-
----
-
-Fast inference: enter faster2_251201 and run benchmark.py (fastest decode) and demo3.py (fastest batch decode) and demo4.py (write 120 webpages in parallel).
-
-Note: demo3.py has efficient standalone Python GUI and you can simply run it on your GPU computer.
-
-While for demo2.py, you have to SSH to the GPU computer to run demo2.py in a SSH session, such that the GPU won't be affected by slow terminal rendering.
-
----
+# Albatross : efficient RWKV inference engine
 
 UPDATE: faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32), on single 5090.
 
@@ -41,6 +29,14 @@ RESULT B=16 T=16 iters=3 p10_ms=14.8019 p50_ms=14.8049 p90_ms=14.8631 tok_s_p50=
 (for better performance, tune linear_orig_layout for your GPU)
 
 UPDATE: faster4_2605_cpp as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
+
+---
+
+Demo: enter faster2_251201 (slower than v3a and v4) and run benchmark.py (fastest decode) and demo3.py (fastest batch decode) and demo4.py (write 120 webpages in parallel).
+
+Note: demo3.py has efficient standalone Python GUI and you can simply run it on your GPU computer.
+
+While for demo2.py, you have to SSH to the GPU computer to run demo2.py in a SSH session, such that the GPU won't be affected by slow terminal rendering.
 
 ---
 
