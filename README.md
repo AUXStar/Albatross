@@ -2,7 +2,7 @@
 
 UPDATE: faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32), on single 5090.
 
-UPDATE: faster3a_2605 is up to 40% faster than faster3_2605 for small B/T.
+UPDATE: faster3a_2605 (currently fastest) is up to 40% faster than faster3_2605 for small B/T.
 ```
 RESULT B=1 T=1 iters=3 p10_ms=6.9425 p50_ms=6.9427 p90_ms=7.1073 tok_s_p50=144.04
 RESULT B=1 T=2 iters=3 p10_ms=7.2224 p50_ms=7.2231 p90_ms=7.3045 tok_s_p50=276.89
@@ -28,7 +28,7 @@ RESULT B=16 T=16 iters=3 p10_ms=14.8019 p50_ms=14.8049 p90_ms=14.8631 tok_s_p50=
 ```
 (for better performance, tune linear_orig_layout for your GPU)
 
-UPDATE: faster4_2605_cpp as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
+UPDATE: faster4_2605_cpp (faster for some BnTn, slower for some BnTn) as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
 
 ---
 
