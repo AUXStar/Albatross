@@ -5,16 +5,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <algorithm>
-#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 
 #include "rwkv7_mega_config.cuh"
 
 namespace {
-namespace cg = cooperative_groups;
 
 constexpr int HEAD_SIZE = 64;
-constexpr int WARPS_PER_BLOCK = 4;
 constexpr float KK_NORMALIZE_EPS = 1.0e-12f;
 constexpr float TMIX_LN_X_EPS = 64.0e-5f;
 constexpr int LN_SMALL_C = 4096;
@@ -22,42 +19,6 @@ constexpr int LN_SMALL_THREADS = 1024;
 constexpr int FFN_SPMV_THREADS = 128;
 constexpr int FFN_TILE = 128;
 
-
-__device__ __forceinline__ int current_smid() {
-    unsigned int smid;
-    asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
-    return static_cast<int>(smid);
-}
-
-__device__ __forceinline__ unsigned long long read_global_timer() {
-    unsigned long long value;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
-    return value;
-}
-
-__device__ __forceinline__ void record_timeline_event(
-    int64_t* __restrict__ timeline,
-    int* __restrict__ counter,
-    int max_events,
-    int inst_idx,
-    int opcode,
-    int event) {
-    if (threadIdx.x != 0) {
-        return;
-    }
-    int slot = atomicAdd(counter, 1);
-    if (slot >= max_events) {
-        return;
-    }
-    int base = slot * 7;
-    timeline[base + 0] = static_cast<int64_t>(read_global_timer());
-    timeline[base + 1] = static_cast<int64_t>(blockIdx.x);
-    timeline[base + 2] = static_cast<int64_t>(current_smid());
-    timeline[base + 3] = static_cast<int64_t>(inst_idx);
-    timeline[base + 4] = static_cast<int64_t>(opcode);
-    timeline[base + 5] = static_cast<int64_t>(event);
-    timeline[base + 6] = static_cast<int64_t>(threadIdx.x);
-}
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -96,21 +57,6 @@ __device__ __forceinline__ void load_half4_float2_u64(const half* __restrict__ p
     v.u64 = *reinterpret_cast<const unsigned long long*>(p);
     lo = __half22float2(half2_from_u32(v.u32.x));
     hi = __half22float2(half2_from_u32(v.u32.y));
-}
-
-__device__ __forceinline__ float block_sum(float v, float* shared) {
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    v = warp_sum(v);
-    if (lane == 0) {
-        shared[warp] = v;
-    }
-    __syncthreads();
-    v = threadIdx.x < (blockDim.x >> 5) ? shared[lane] : 0.0f;
-    if (warp == 0) {
-        v = warp_sum(v);
-    }
-    return v;
 }
 
 template <int THREADS>
@@ -741,449 +687,6 @@ __device__ __forceinline__ void rkv_executor_tile_body(
     }
 }
 
-template <int THREADS, int RKV_OUT_TILE>
-__device__ __noinline__ void rkv_executor_tile_body_noinline(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C) {
-    rkv_executor_tile_body<THREADS, RKV_OUT_TILE>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-}
-
-template <int THREADS>
-__device__ __forceinline__ void rkv_executor_tile_body_warp4(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C) {
-    constexpr int RKV_OUT_TILE = 2;
-    constexpr int WARPS = THREADS / 32;
-    int rows_per_group = C / RKV_OUT_TILE;
-    int task_group = (rows_per_group + WARPS - 1) / WARPS;
-    int group = task / task_group;
-    int task_in_group = task - group * task_group;
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row_pair = task_in_group * WARPS + warp;
-    if (group >= 3 || row_pair >= rows_per_group) {
-        return;
-    }
-    int row0 = row_pair * RKV_OUT_TILE;
-    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
-    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
-    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (int k = lane << 2; k < C; k += 32 << 2) {
-        float2 x0 = __half22float2(*reinterpret_cast<const half2*>(inp + k));
-        float2 x1 = __half22float2(*reinterpret_cast<const half2*>(inp + k + 2));
-        const half* w0 = wt + static_cast<int64_t>(row0) * C + k;
-        const half* w1 = w0 + C;
-        float2 w00 = __half22float2(*reinterpret_cast<const half2*>(w0));
-        float2 w01 = __half22float2(*reinterpret_cast<const half2*>(w0 + 2));
-        float2 w10 = __half22float2(*reinterpret_cast<const half2*>(w1));
-        float2 w11 = __half22float2(*reinterpret_cast<const half2*>(w1 + 2));
-        acc0 = fmaf(x0.x, w00.x, acc0);
-        acc0 = fmaf(x0.y, w00.y, acc0);
-        acc0 = fmaf(x1.x, w01.x, acc0);
-        acc0 = fmaf(x1.y, w01.y, acc0);
-        acc1 = fmaf(x0.x, w10.x, acc1);
-        acc1 = fmaf(x0.y, w10.y, acc1);
-        acc1 = fmaf(x1.x, w11.x, acc1);
-        acc1 = fmaf(x1.y, w11.y, acc1);
-    }
-
-    float sum0 = warp_sum(acc0);
-    float sum1 = warp_sum(acc1);
-    if (lane == 0) {
-        out[row0] = __float2half_rn(sum0);
-        out[row0 + 1] = __float2half_rn(sum1);
-    }
-}
-
-template <int THREADS, int RKV_OUT_TILE>
-__device__ __forceinline__ void rkv_executor_tile_body_timeline(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C,
-    int64_t* __restrict__ timeline,
-    int* __restrict__ timeline_counter,
-    int max_events) {
-    __shared__ float partial[THREADS / 32][RKV_OUT_TILE];
-    int rows_per_group = C / RKV_OUT_TILE;
-    int group = task / rows_per_group;
-    int row0 = (task - group * rows_per_group) * RKV_OUT_TILE;
-    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
-    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
-    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
-
-    float acc[RKV_OUT_TILE];
-#pragma unroll
-    for (int j = 0; j < RKV_OUT_TILE; ++j) {
-        acc[j] = 0.0f;
-    }
-    for (int k = threadIdx.x << 2; k < C; k += THREADS << 2) {
-        float2 x0 = __half22float2(*reinterpret_cast<const half2*>(inp + k));
-        float2 x1 = __half22float2(*reinterpret_cast<const half2*>(inp + k + 2));
-#pragma unroll
-        for (int j = 0; j < RKV_OUT_TILE; ++j) {
-            const half* wj = wt + static_cast<int64_t>(row0 + j) * C + k;
-            float2 w0 = __half22float2(*reinterpret_cast<const half2*>(wj));
-            float2 w1v = __half22float2(*reinterpret_cast<const half2*>(wj + 2));
-            acc[j] = fmaf(x0.x, w0.x, acc[j]);
-            acc[j] = fmaf(x0.y, w0.y, acc[j]);
-            acc[j] = fmaf(x1.x, w1v.x, acc[j]);
-            acc[j] = fmaf(x1.y, w1v.y, acc[j]);
-        }
-    }
-    __syncthreads();
-    record_timeline_event(timeline, timeline_counter, max_events, task, rwkv7_mega::OP_RKV_LINEAR_GROUP, 8);
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-#pragma unroll
-    for (int j = 0; j < RKV_OUT_TILE; ++j) {
-        float v = warp_sum(acc[j]);
-        if (lane == 0) {
-            partial[warp][j] = v;
-        }
-    }
-    __syncthreads();
-    record_timeline_event(timeline, timeline_counter, max_events, task, rwkv7_mega::OP_RKV_LINEAR_GROUP, 9);
-    if (threadIdx.x == 0) {
-#pragma unroll
-        for (int j = 0; j < RKV_OUT_TILE; ++j) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int widx = 0; widx < THREADS / 32; ++widx) {
-                sum += partial[widx][j];
-            }
-            out[row0 + j] = __float2half_rn(sum);
-        }
-    }
-}
-
-template <int THREADS>
-__device__ __forceinline__ void rkv_executor_tile_body_prefetch2(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C) {
-    constexpr int RKV_OUT_TILE = 2;
-    __shared__ float partial[THREADS / 32][RKV_OUT_TILE];
-    int rows_per_group = C / RKV_OUT_TILE;
-    int group = task / rows_per_group;
-    int row0 = (task - group * rows_per_group) * RKV_OUT_TILE;
-    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
-    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
-    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const int stride = THREADS << 2;
-    int k = threadIdx.x << 2;
-
-    float2 x0, x1, w00, w01, w10, w11;
-    if (k < C) {
-        x0 = __half22float2(*reinterpret_cast<const half2*>(inp + k));
-        x1 = __half22float2(*reinterpret_cast<const half2*>(inp + k + 2));
-        const half* w0 = wt + static_cast<int64_t>(row0) * C + k;
-        const half* w1 = w0 + C;
-        w00 = __half22float2(*reinterpret_cast<const half2*>(w0));
-        w01 = __half22float2(*reinterpret_cast<const half2*>(w0 + 2));
-        w10 = __half22float2(*reinterpret_cast<const half2*>(w1));
-        w11 = __half22float2(*reinterpret_cast<const half2*>(w1 + 2));
-    }
-    for (; k < C; k += stride) {
-        const int next = k + stride;
-        float2 nx0, nx1, nw00, nw01, nw10, nw11;
-        if (next < C) {
-            nx0 = __half22float2(*reinterpret_cast<const half2*>(inp + next));
-            nx1 = __half22float2(*reinterpret_cast<const half2*>(inp + next + 2));
-            const half* nw0 = wt + static_cast<int64_t>(row0) * C + next;
-            const half* nw1 = nw0 + C;
-            nw00 = __half22float2(*reinterpret_cast<const half2*>(nw0));
-            nw01 = __half22float2(*reinterpret_cast<const half2*>(nw0 + 2));
-            nw10 = __half22float2(*reinterpret_cast<const half2*>(nw1));
-            nw11 = __half22float2(*reinterpret_cast<const half2*>(nw1 + 2));
-        }
-
-        acc0 = fmaf(x0.x, w00.x, acc0);
-        acc0 = fmaf(x0.y, w00.y, acc0);
-        acc0 = fmaf(x1.x, w01.x, acc0);
-        acc0 = fmaf(x1.y, w01.y, acc0);
-        acc1 = fmaf(x0.x, w10.x, acc1);
-        acc1 = fmaf(x0.y, w10.y, acc1);
-        acc1 = fmaf(x1.x, w11.x, acc1);
-        acc1 = fmaf(x1.y, w11.y, acc1);
-
-        if (next < C) {
-            x0 = nx0;
-            x1 = nx1;
-            w00 = nw00;
-            w01 = nw01;
-            w10 = nw10;
-            w11 = nw11;
-        }
-    }
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    float v0 = warp_sum(acc0);
-    float v1 = warp_sum(acc1);
-    if (lane == 0) {
-        partial[warp][0] = v0;
-        partial[warp][1] = v1;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-#pragma unroll
-        for (int widx = 0; widx < THREADS / 32; ++widx) {
-            sum0 += partial[widx][0];
-            sum1 += partial[widx][1];
-        }
-        out[row0] = __float2half_rn(sum0);
-        out[row0 + 1] = __float2half_rn(sum1);
-    }
-}
-
-template <int THREADS>
-__device__ __forceinline__ void rkv_executor_tile_body_prefetch2x2(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C) {
-    constexpr int RKV_OUT_TILE = 2;
-    __shared__ float partial[THREADS / 32][RKV_OUT_TILE];
-    int rows_per_group = C / RKV_OUT_TILE;
-    int group = task / rows_per_group;
-    int row0 = (task - group * rows_per_group) * RKV_OUT_TILE;
-    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
-    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
-    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const int stride = THREADS << 2;
-    int k = threadIdx.x << 2;
-
-    float2 x00, x01, w000, w001, w010, w011;
-    float2 x10, x11, w100, w101, w110, w111;
-    bool valid0 = k < C;
-    bool valid1 = (k + stride) < C;
-    if (valid0) {
-        x00 = __half22float2(*reinterpret_cast<const half2*>(inp + k));
-        x01 = __half22float2(*reinterpret_cast<const half2*>(inp + k + 2));
-        const half* w0 = wt + static_cast<int64_t>(row0) * C + k;
-        const half* w1 = w0 + C;
-        w000 = __half22float2(*reinterpret_cast<const half2*>(w0));
-        w001 = __half22float2(*reinterpret_cast<const half2*>(w0 + 2));
-        w010 = __half22float2(*reinterpret_cast<const half2*>(w1));
-        w011 = __half22float2(*reinterpret_cast<const half2*>(w1 + 2));
-    }
-    if (valid1) {
-        int k1 = k + stride;
-        x10 = __half22float2(*reinterpret_cast<const half2*>(inp + k1));
-        x11 = __half22float2(*reinterpret_cast<const half2*>(inp + k1 + 2));
-        const half* w0 = wt + static_cast<int64_t>(row0) * C + k1;
-        const half* w1 = w0 + C;
-        w100 = __half22float2(*reinterpret_cast<const half2*>(w0));
-        w101 = __half22float2(*reinterpret_cast<const half2*>(w0 + 2));
-        w110 = __half22float2(*reinterpret_cast<const half2*>(w1));
-        w111 = __half22float2(*reinterpret_cast<const half2*>(w1 + 2));
-    }
-
-    for (; valid0; k += stride << 1) {
-        const int next0 = k + (stride << 1);
-        const int next1 = next0 + stride;
-        float2 nx00, nx01, nw000, nw001, nw010, nw011;
-        float2 nx10, nx11, nw100, nw101, nw110, nw111;
-        bool nvalid0 = next0 < C;
-        bool nvalid1 = next1 < C;
-        if (nvalid0) {
-            nx00 = __half22float2(*reinterpret_cast<const half2*>(inp + next0));
-            nx01 = __half22float2(*reinterpret_cast<const half2*>(inp + next0 + 2));
-            const half* nw0 = wt + static_cast<int64_t>(row0) * C + next0;
-            const half* nw1 = nw0 + C;
-            nw000 = __half22float2(*reinterpret_cast<const half2*>(nw0));
-            nw001 = __half22float2(*reinterpret_cast<const half2*>(nw0 + 2));
-            nw010 = __half22float2(*reinterpret_cast<const half2*>(nw1));
-            nw011 = __half22float2(*reinterpret_cast<const half2*>(nw1 + 2));
-        }
-        if (nvalid1) {
-            nx10 = __half22float2(*reinterpret_cast<const half2*>(inp + next1));
-            nx11 = __half22float2(*reinterpret_cast<const half2*>(inp + next1 + 2));
-            const half* nw0 = wt + static_cast<int64_t>(row0) * C + next1;
-            const half* nw1 = nw0 + C;
-            nw100 = __half22float2(*reinterpret_cast<const half2*>(nw0));
-            nw101 = __half22float2(*reinterpret_cast<const half2*>(nw0 + 2));
-            nw110 = __half22float2(*reinterpret_cast<const half2*>(nw1));
-            nw111 = __half22float2(*reinterpret_cast<const half2*>(nw1 + 2));
-        }
-
-        acc0 = fmaf(x00.x, w000.x, acc0);
-        acc0 = fmaf(x00.y, w000.y, acc0);
-        acc0 = fmaf(x01.x, w001.x, acc0);
-        acc0 = fmaf(x01.y, w001.y, acc0);
-        acc1 = fmaf(x00.x, w010.x, acc1);
-        acc1 = fmaf(x00.y, w010.y, acc1);
-        acc1 = fmaf(x01.x, w011.x, acc1);
-        acc1 = fmaf(x01.y, w011.y, acc1);
-        if (valid1) {
-            acc0 = fmaf(x10.x, w100.x, acc0);
-            acc0 = fmaf(x10.y, w100.y, acc0);
-            acc0 = fmaf(x11.x, w101.x, acc0);
-            acc0 = fmaf(x11.y, w101.y, acc0);
-            acc1 = fmaf(x10.x, w110.x, acc1);
-            acc1 = fmaf(x10.y, w110.y, acc1);
-            acc1 = fmaf(x11.x, w111.x, acc1);
-            acc1 = fmaf(x11.y, w111.y, acc1);
-        }
-
-        valid0 = nvalid0;
-        valid1 = nvalid1;
-        if (nvalid0) {
-            x00 = nx00;
-            x01 = nx01;
-            w000 = nw000;
-            w001 = nw001;
-            w010 = nw010;
-            w011 = nw011;
-        }
-        if (nvalid1) {
-            x10 = nx10;
-            x11 = nx11;
-            w100 = nw100;
-            w101 = nw101;
-            w110 = nw110;
-            w111 = nw111;
-        }
-    }
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    float v0 = warp_sum(acc0);
-    float v1 = warp_sum(acc1);
-    if (lane == 0) {
-        partial[warp][0] = v0;
-        partial[warp][1] = v1;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-#pragma unroll
-        for (int widx = 0; widx < THREADS / 32; ++widx) {
-            sum0 += partial[widx][0];
-            sum1 += partial[widx][1];
-        }
-        out[row0] = __float2half_rn(sum0);
-        out[row0 + 1] = __float2half_rn(sum1);
-    }
-}
-
-template <int THREADS>
-__device__ __forceinline__ void rkv_executor_tile_body_u64(
-    const half* __restrict__ xr,
-    const half* __restrict__ xk,
-    const half* __restrict__ xv,
-    const half* __restrict__ wr,
-    const half* __restrict__ wk,
-    const half* __restrict__ wv,
-    half* __restrict__ yr,
-    half* __restrict__ yk,
-    half* __restrict__ yv,
-    int task,
-    int C) {
-    constexpr int RKV_OUT_TILE = 2;
-    __shared__ float partial[THREADS / 32][RKV_OUT_TILE];
-    int rows_per_group = C / RKV_OUT_TILE;
-    int group = task / rows_per_group;
-    int row0 = (task - group * rows_per_group) * RKV_OUT_TILE;
-    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
-    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
-    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
-
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (int k = threadIdx.x << 2; k < C; k += THREADS << 2) {
-        float2 x0, x1, w00, w01, w10, w11;
-        load_half4_float2_u64(inp + k, x0, x1);
-        const half* w0 = wt + static_cast<int64_t>(row0) * C + k;
-        const half* w1 = w0 + C;
-        load_half4_float2_u64(w0, w00, w01);
-        load_half4_float2_u64(w1, w10, w11);
-        acc0 = fmaf(x0.x, w00.x, acc0);
-        acc0 = fmaf(x0.y, w00.y, acc0);
-        acc0 = fmaf(x1.x, w01.x, acc0);
-        acc0 = fmaf(x1.y, w01.y, acc0);
-        acc1 = fmaf(x0.x, w10.x, acc1);
-        acc1 = fmaf(x0.y, w10.y, acc1);
-        acc1 = fmaf(x1.x, w11.x, acc1);
-        acc1 = fmaf(x1.y, w11.y, acc1);
-    }
-
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    float v0 = warp_sum(acc0);
-    float v1 = warp_sum(acc1);
-    if (lane == 0) {
-        partial[warp][0] = v0;
-        partial[warp][1] = v1;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float sum0 = 0.0f;
-        float sum1 = 0.0f;
-#pragma unroll
-        for (int widx = 0; widx < THREADS / 32; ++widx) {
-            sum0 += partial[widx][0];
-            sum1 += partial[widx][1];
-        }
-        out[row0] = __float2half_rn(sum0);
-        out[row0 + 1] = __float2half_rn(sum1);
-    }
-}
-
 template <int THREADS>
 __device__ __forceinline__ void lowrank_pre_compact_body(
     const half* __restrict__ xw,
@@ -1241,32 +744,6 @@ __device__ __forceinline__ void lowrank_pre_compact_body(
             y[static_cast<int64_t>(m) * R + r] = __float2half_rn(sum);
         }
     }
-}
-
-template <int THREADS>
-__device__ __noinline__ void lowrank_pre_compact_body_noinline(
-    const half* __restrict__ xw,
-    const half* __restrict__ xa,
-    const half* __restrict__ xg,
-    const half* __restrict__ xlr_v,
-    const half* __restrict__ w1_t,
-    const half* __restrict__ a1_t,
-    const half* __restrict__ g1_t,
-    const half* __restrict__ v1_t,
-    half* __restrict__ w1,
-    half* __restrict__ a1,
-    half* __restrict__ g1,
-    half* __restrict__ v1,
-    int task,
-    int M,
-    int C,
-    int Rw,
-    int Ra,
-    int Rg,
-    int Rv) {
-    lowrank_pre_compact_body<THREADS>(
-        xw, xa, xg, xlr_v, w1_t, a1_t, g1_t, v1_t, w1, a1, g1, v1,
-        task, M, C, Rw, Ra, Rg, Rv);
 }
 
 template <int THREADS, int OUT_TILE>
@@ -1373,77 +850,6 @@ __device__ __forceinline__ int lowrank_rank_out4_body(
                 } else {
                     y[idx] = __float2half_rn(sum);
                 }
-            }
-        }
-    }
-    return group;
-}
-
-template <int THREADS, int OUT_TILE>
-__device__ __forceinline__ int lowrank_wg_rank_out_body(
-    const half* __restrict__ w1,
-    const half* __restrict__ g1,
-    const half* __restrict__ w2_t,
-    const half* __restrict__ g2_t,
-    half* __restrict__ w,
-    half* __restrict__ g,
-    int task,
-    int M,
-    int C,
-    int Rw,
-    int Rg) {
-    int tiles = (C + OUT_TILE - 1) / OUT_TILE;
-    int tile = task % tiles;
-    int rem = task / tiles;
-    int group = rem & 1;
-    int m = rem >> 1;
-    int n0 = tile * OUT_TILE;
-    const int R = group == 0 ? Rw : Rg;
-    const half* x = group == 0 ? w1 : g1;
-    const half* wt = group == 0 ? w2_t : g2_t;
-    half* y = group == 0 ? w : g;
-    if (m >= M) {
-        return group;
-    }
-    float acc[OUT_TILE];
-#pragma unroll
-    for (int j = 0; j < OUT_TILE; ++j) {
-        acc[j] = 0.0f;
-    }
-    const half* x_row = x + static_cast<int64_t>(m) * R;
-    for (int r = threadIdx.x; r < R; r += THREADS) {
-        float xv0 = __half2float(x_row[r]);
-        xv0 = group == 0 ? tanhf(xv0) : sigmoid_fast(xv0);
-#pragma unroll
-        for (int j = 0; j < OUT_TILE; ++j) {
-            int n = n0 + j;
-            if (n < C) {
-                acc[j] = fmaf(xv0, __half2float(wt[static_cast<int64_t>(n) * R + r]), acc[j]);
-            }
-        }
-    }
-    __shared__ float partial[THREADS / 32][OUT_TILE];
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-#pragma unroll
-    for (int j = 0; j < OUT_TILE; ++j) {
-        acc[j] = warp_sum(acc[j]);
-        if (lane == 0) {
-            partial[warp][j] = acc[j];
-        }
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-#pragma unroll
-        for (int j = 0; j < OUT_TILE; ++j) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int u = 0; u < THREADS / 32; ++u) {
-                sum += partial[u][j];
-            }
-            int n = n0 + j;
-            if (n < C) {
-                y[static_cast<int64_t>(m) * C + n] = __float2half_rn(sum);
             }
         }
     }
@@ -1622,95 +1028,7 @@ __device__ __forceinline__ int lowrank_rank_out4_kk_body(
     return group;
 }
 
-template <int THREADS, int OUT_TILE>
-__device__ __forceinline__ int lowrank_rank_out4_warp_cols_body(
-    const half* __restrict__ w1,
-    const half* __restrict__ a1,
-    const half* __restrict__ g1,
-    const half* __restrict__ v1,
-    const half* __restrict__ w2_t,
-    const half* __restrict__ a2_t,
-    const half* __restrict__ g2_t,
-    const half* __restrict__ v2_t,
-    const half* __restrict__ v,
-    const half* __restrict__ v_first,
-    const half* __restrict__ v0,
-    half* __restrict__ w,
-    half* __restrict__ a,
-    half* __restrict__ g,
-    half* __restrict__ v_out,
-    int task,
-    int M,
-    int C,
-    int Rw,
-    int Ra,
-    int Rg,
-    int Rv) {
-    const int tiles = (C + OUT_TILE - 1) / OUT_TILE;
-    const int tile = task % tiles;
-    const int rem = task / tiles;
-    const int group = rem % 4;
-    const int m = rem / 4;
-    const int n0 = tile * OUT_TILE;
-    int R = Rw;
-    const half* x = w1;
-    const half* wt = w2_t;
-    half* y = w;
-    if (group == 1) {
-        R = Ra;
-        x = a1;
-        wt = a2_t;
-        y = a;
-    } else if (group == 2) {
-        R = Rg;
-        x = g1;
-        wt = g2_t;
-        y = g;
-    } else if (group == 3) {
-        R = Rv;
-        x = v1;
-        wt = v2_t;
-        y = v_out;
-    }
-    if (m >= M) {
-        return group;
-    }
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    if (warp >= OUT_TILE) {
-        return group;
-    }
-    const int n = n0 + warp;
-    if (n >= C) {
-        return group;
-    }
-    float acc = 0.0f;
-    const half* x_row = x + static_cast<int64_t>(m) * R;
-    for (int r = lane; r < R; r += 32) {
-        float xv0 = __half2float(x_row[r]);
-        if (group == 0) {
-            xv0 = tanhf(xv0);
-        } else if (group == 2) {
-            xv0 = sigmoid_fast(xv0);
-        }
-        acc = fmaf(xv0, __half2float(wt[static_cast<int64_t>(n) * R + r]), acc);
-    }
-    acc = warp_sum(acc);
-    if (lane == 0) {
-        int64_t idx = static_cast<int64_t>(m) * C + n;
-        if (group == 3) {
-            float vv = __half2float(v[idx]);
-            float vf = __half2float(v_first[idx]);
-            float gate = sigmoid_fast(__half2float(v0[n]) + acc);
-            y[idx] = __float2half_rn(fmaf(vf - vv, gate, vv));
-        } else {
-            y[idx] = __float2half_rn(acc);
-        }
-    }
-    return group;
-}
-
-template <int THREADS, int RKV_OUT_TILE, bool RECORD_EVENTS, bool FORCE_TASK_SYNC, int MIN_BLOCKS = 1, int ROLE_ORDER = -1>
+template <int THREADS, int RKV_OUT_TILE, bool FORCE_TASK_SYNC, int MIN_BLOCKS = 1, int ROLE_ORDER = -1>
 __global__ __launch_bounds__(THREADS, MIN_BLOCKS) void rkv_lowrank_pre_executor_kernel(
     const half* __restrict__ xr,
     const half* __restrict__ xk,
@@ -1737,9 +1055,6 @@ __global__ __launch_bounds__(THREADS, MIN_BLOCKS) void rkv_lowrank_pre_executor_
     half* __restrict__ v1,
     half* __restrict__ w,
     half* __restrict__ g,
-    int* __restrict__ counter,
-    int64_t* __restrict__ timeline,
-    int max_events,
     int M,
     int C,
     int Rw,
@@ -1747,30 +1062,8 @@ __global__ __launch_bounds__(THREADS, MIN_BLOCKS) void rkv_lowrank_pre_executor_
     int Rg,
     int Rv,
     int lowrank_worker_budget,
-    int early_wg_rankout,
-    int rkv_body_mode,
     int role_order) {
-    const int rkv_rows_per_group = C / RKV_OUT_TILE;
-    const int rkv_tasks = (rkv_body_mode == 5 && RKV_OUT_TILE == 2)
-        ? 3 * ((rkv_rows_per_group + (THREADS / 32) - 1) / (THREADS / 32))
-        : 3 * rkv_rows_per_group;
-    if constexpr (RECORD_EVENTS) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            counter[0] = rkv_tasks; // RKV tile task count
-            counter[1] = M * (Rw + Ra + Rg + Rv); // LOWRANK_PRE task count
-            counter[2] = 0; // finished RKV worker blocks
-            counter[3] = 0; // finished LOWRANK_PRE worker blocks
-            counter[5] = 0; // timeline event counter
-            __threadfence();
-            counter[4] = 1; // ready
-        }
-        if (threadIdx.x == 0) {
-            while (atomicAdd(counter + 4, 0) != 1) {
-            }
-        }
-        __syncthreads();
-    }
-
+    const int rkv_tasks = 3 * (C / RKV_OUT_TILE);
     const int lowrank_tasks = M * (Rw + Ra + Rg + Rv);
     int lowrank_workers = lowrank_worker_budget > 0 ? lowrank_worker_budget : static_cast<int>(gridDim.x) / 4;
     if (lowrank_workers < 0) {
@@ -1807,108 +1100,21 @@ __global__ __launch_bounds__(THREADS, MIN_BLOCKS) void rkv_lowrank_pre_executor_
         : (lowrank_interleave ? bid - interleave_lowrank_before : (lowrank_first ? bid - lowrank_workers : bid));
     const int worker_count = lowrank_worker ? lowrank_workers : rkv_workers;
     const bool needs_task_sync = FORCE_TASK_SYNC || worker_count < (lowrank_worker ? lowrank_tasks : rkv_tasks);
-    if constexpr (RECORD_EVENTS) {
-        record_timeline_event(
-            timeline,
-            counter + 5,
-            max_events,
-            static_cast<int>(blockIdx.x),
-            lowrank_worker ? rwkv7_mega::OP_LOWRANK_PRE : rwkv7_mega::OP_RKV_LINEAR_GROUP,
-            6);
-    }
-
     if (lowrank_worker) {
         for (int task = worker_rank; task < lowrank_tasks; task += worker_count) {
-            if constexpr (RECORD_EVENTS) {
-                record_timeline_event(timeline, counter + 5, max_events, task, rwkv7_mega::OP_LOWRANK_PRE, 1);
-            }
-
-            if (rkv_body_mode == 4) {
-                lowrank_pre_compact_body_noinline<THREADS>(
-                    xw, xa, xg, xlr_v, w1_t, a1_t, g1_t, v1_t, w1, a1, g1, v1,
-                    task, M, C, Rw, Ra, Rg, Rv);
-            } else {
-                lowrank_pre_compact_body<THREADS>(
-                    xw, xa, xg, xlr_v, w1_t, a1_t, g1_t, v1_t, w1, a1, g1, v1,
-                    task, M, C, Rw, Ra, Rg, Rv);
-            }
-            if constexpr (RECORD_EVENTS) {
-                record_timeline_event(timeline, counter + 5, max_events, task, rwkv7_mega::OP_LOWRANK_PRE, 2);
-            }
+            lowrank_pre_compact_body<THREADS>(
+                xw, xa, xg, xlr_v, w1_t, a1_t, g1_t, v1_t, w1, a1, g1, v1,
+                task, M, C, Rw, Ra, Rg, Rv);
             if (needs_task_sync) {
                 __syncthreads();
-            }
-        }
-        if (early_wg_rankout != 0) {
-            if (threadIdx.x == 0) {
-                __threadfence();
-                atomicAdd(counter + 3, 1);
-                while (atomicAdd(counter + 3, 0) != lowrank_workers) {
-                }
-            }
-            __syncthreads();
-            constexpr int LOWRANK_OUT_TILE = 4;
-            const int wg_tasks = M * 2 * ((C + LOWRANK_OUT_TILE - 1) / LOWRANK_OUT_TILE);
-            for (int task = worker_rank; task < wg_tasks; task += worker_count) {
-                lowrank_wg_rank_out_body<THREADS, LOWRANK_OUT_TILE>(
-                    w1, g1, w2_t, g2_t, w, g, task, M, C, Rw, Rg);
-                __syncthreads();
-            }
-        } else {
-            if constexpr (RECORD_EVENTS) {
-            if (threadIdx.x == 0) {
-                atomicAdd(counter + 3, 1);
-            }
             }
         }
     } else {
         for (int task = worker_rank; task < rkv_tasks; task += worker_count) {
-            if constexpr (RECORD_EVENTS) {
-                record_timeline_event(timeline, counter + 5, max_events, task, rwkv7_mega::OP_RKV_LINEAR_GROUP, 1);
-            }
-            if constexpr (RECORD_EVENTS) {
-                if (rkv_body_mode == 0) {
-                    rkv_executor_tile_body_timeline<THREADS, RKV_OUT_TILE>(
-                        xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C, timeline, counter + 5, max_events);
-                } else if (rkv_body_mode == 4) {
-                    rkv_executor_tile_body_noinline<THREADS, RKV_OUT_TILE>(
-                        xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                } else if (rkv_body_mode == 5 && RKV_OUT_TILE == 2) {
-                    rkv_executor_tile_body_warp4<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                } else if (rkv_body_mode == 3 && RKV_OUT_TILE == 2) {
-                    rkv_executor_tile_body_u64<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                } else if (rkv_body_mode == 2 && RKV_OUT_TILE == 2) {
-                    rkv_executor_tile_body_prefetch2x2<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                } else if (rkv_body_mode == 1 && RKV_OUT_TILE == 2) {
-                    rkv_executor_tile_body_prefetch2<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                } else {
-                    rkv_executor_tile_body<THREADS, RKV_OUT_TILE>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-                }
-            } else if (rkv_body_mode == 4) {
-                rkv_executor_tile_body_noinline<THREADS, RKV_OUT_TILE>(
-                    xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            } else if (rkv_body_mode == 5 && RKV_OUT_TILE == 2) {
-                rkv_executor_tile_body_warp4<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            } else if (rkv_body_mode == 3 && RKV_OUT_TILE == 2) {
-                rkv_executor_tile_body_u64<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            } else if (rkv_body_mode == 2 && RKV_OUT_TILE == 2) {
-                rkv_executor_tile_body_prefetch2x2<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            } else if (rkv_body_mode == 1 && RKV_OUT_TILE == 2) {
-                rkv_executor_tile_body_prefetch2<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            } else {
-                rkv_executor_tile_body<THREADS, RKV_OUT_TILE>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
-            }
-            if constexpr (RECORD_EVENTS) {
-                record_timeline_event(timeline, counter + 5, max_events, task, rwkv7_mega::OP_RKV_LINEAR_GROUP, 2);
-            }
+            rkv_executor_tile_body<THREADS, RKV_OUT_TILE>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
             if (needs_task_sync) {
                 __syncthreads();
             }
-        }
-        if constexpr (RECORD_EVENTS) {
-        if (threadIdx.x == 0) {
-            atomicAdd(counter + 2, 1);
-        }
         }
     }
 }
@@ -2199,26 +1405,17 @@ void rwkv7_mega_rkv_lowrank_pre_executor_into_cuda(
     torch::Tensor v1,
     torch::Tensor w,
     torch::Tensor g,
-    torch::Tensor counter,
-    torch::Tensor timeline,
     int64_t blocks,
     int64_t threads,
     int64_t lowrank_worker_budget,
     int64_t rkv_out_tile,
-    int64_t force_task_sync,
-    int64_t launch_min_blocks,
-    int64_t early_wg_rankout,
-    int64_t rkv_body_mode,
     int64_t role_order) {
     (void)w2_t;
     (void)g2_t;
     (void)w;
     (void)g;
-    TORCH_CHECK(timeline.numel() == 0, "260602 rkv executor smoke path expects empty timeline");
-    TORCH_CHECK(threads == 128 && rkv_out_tile == 2 && force_task_sync == 1 && launch_min_blocks == 1,
-                "260602 rkv executor requires threads=128 rkv_out_tile=2 force_sync=1 min_blocks=1");
-    TORCH_CHECK(early_wg_rankout == 0 && rkv_body_mode == 0 && role_order == 2,
-                "260602 rkv executor requires early_wg_rankout=0 body_mode=0 role_order=2");
+    TORCH_CHECK(threads == 128 && rkv_out_tile == 2 && role_order == 2,
+                "260602 rkv executor requires threads=128 rkv_out_tile=2 role_order=2");
     int64_t C64 = xr.numel();
     int M = static_cast<int>(xw.numel() / C64);
     int C = static_cast<int>(C64);
@@ -2227,7 +1424,7 @@ void rwkv7_mega_rkv_lowrank_pre_executor_into_cuda(
     int Rg = static_cast<int>(g1_t.size(0));
     int Rv = static_cast<int>(v1_t.size(0));
     auto stream = at::cuda::getCurrentCUDAStream();
-    rkv_lowrank_pre_executor_kernel<128, 2, false, true, 1, 2><<<static_cast<unsigned int>(blocks), 128, 0, stream>>>(
+    rkv_lowrank_pre_executor_kernel<128, 2, true, 1, 2><<<static_cast<unsigned int>(blocks), 128, 0, stream>>>(
         reinterpret_cast<const half*>(xr.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(xk.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(xv.data_ptr<at::Half>()),
@@ -2253,13 +1450,8 @@ void rwkv7_mega_rkv_lowrank_pre_executor_into_cuda(
         reinterpret_cast<half*>(v1.data_ptr<at::Half>()),
         reinterpret_cast<half*>(w.data_ptr<at::Half>()),
         reinterpret_cast<half*>(g.data_ptr<at::Half>()),
-        counter.data_ptr<int>(),
-        nullptr,
-        0,
         M, C, Rw, Ra, Rg, Rv,
         static_cast<int>(lowrank_worker_budget),
-        0,
-        0,
         2);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -2442,4 +1634,3 @@ void rwkv7_mega_add_last_layer_norm_f16_into_cuda(torch::Tensor x, torch::Tensor
         static_cast<float>(eps));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-

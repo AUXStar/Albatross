@@ -90,8 +90,6 @@ def make_layer_work(z: dict[str, torch.Tensor], layer: int, C: int, ffn: int, H:
         "cmix_hid": torch.empty(ffn, device="cuda", dtype=DTYPE),
         "cmix_out": torch.empty(C, device="cuda", dtype=DTYPE),
         "cmix_tmp": torch.empty(C, device="cuda", dtype=torch.float32),
-        "rkv_lowrank_counter": torch.empty(12, device="cuda", dtype=torch.int32),
-        "rkv_lowrank_empty_timeline": torch.empty(0, 7, device="cuda", dtype=torch.int64),
         "lr_w1": torch.empty(1, z[p + "att.w1.t"].size(0), device="cuda", dtype=DTYPE),
         "lr_a1": torch.empty(1, z[p + "att.a1.t"].size(0), device="cuda", dtype=DTYPE),
         "lr_g1": torch.empty(1, z[p + "att.g1.t"].size(0), device="cuda", dtype=DTYPE),
@@ -198,9 +196,8 @@ class RWKV7FastB1T1260602:
             work["xw"].view(1, self.C), work["xa"].view(1, self.C), work["xg"].view(1, self.C), work["xv"].view(1, self.C),
             z[p + "att.w1.t"], z[p + "att.a1.t"], z[p + "att.g1.t"], z[p + "att.v1.t"], z[p + "att.w2.t"], z[p + "att.g2.t"],
             scratch["w1"], scratch["a1"], scratch["g1"], scratch["v1"], scratch["w"], scratch["g"],
-            work["rkv_lowrank_counter"], work["rkv_lowrank_empty_timeline"],
             RKV_EXECUTOR_BLOCKS, RKV_EXECUTOR_THREADS, RKV_EXECUTOR_WORKERS, RKV_OUT_TILE,
-            1, 1, 0, 0, RKV_ROLE_ORDER_LRINT8,
+            RKV_ROLE_ORDER_LRINT8,
         )
         r = work["r"].view(1, 1, self.C)
         k_raw = work["k_raw"].view_as(r)
