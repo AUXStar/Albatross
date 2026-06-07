@@ -89,7 +89,6 @@ def make_layer_work(z: dict[str, torch.Tensor], layer: int, C: int, ffn: int, H:
         "att": torch.empty(C, device="cuda", dtype=DTYPE),
         "cmix_hid": torch.empty(ffn, device="cuda", dtype=DTYPE),
         "cmix_out": torch.empty(C, device="cuda", dtype=DTYPE),
-        "cmix_tmp": torch.empty(C, device="cuda", dtype=torch.float32),
         "lr_w1": torch.empty(1, z[p + "att.w1.t"].size(0), device="cuda", dtype=DTYPE),
         "lr_a1": torch.empty(1, z[p + "att.a1.t"].size(0), device="cuda", dtype=DTYPE),
         "lr_g1": torch.empty(1, z[p + "att.g1.t"].size(0), device="cuda", dtype=DTYPE),
@@ -123,8 +122,8 @@ class RWKV7FastB1T1260602:
         torch.cuda.synchronize()
         print(
             f"[260602] ready L={self.L} C={self.C} H={self.H} V={self.V} "
-            f"rkv_executor=lrint8 blocks={RKV_EXECUTOR_BLOCKS} workers={RKV_EXECUTOR_WORKERS} "
-            f"cmix=nofc_f32acc_key_vec4_vtile tail=split load_s={time.perf_counter() - t0:.3f}",
+            f"rkv_executor=k2pipe_body21 blocks={RKV_EXECUTOR_BLOCKS} workers={RKV_EXECUTOR_WORKERS} "
+            f"cmix=nofc_f32acc_key_vec4_vtile_hfma2_split2 tail=split load_s={time.perf_counter() - t0:.3f}",
             flush=True,
         )
 
@@ -225,7 +224,7 @@ class RWKV7FastB1T1260602:
         ops.row1_linear_exact4_vec4_threads_tile_into(
             work["cmix_mixed"].view(-1).contiguous(), z[p + "ffn.key.weight"], work["cmix_hid"], CMIX_KEY_THREADS, CMIX_KEY_OUT_TILE
         )
-        ops.cmix_sparse_down_relu_one_f32acc_vtile_into(work["cmix_hid"], z[p + "ffn.value.weight.sparse"], work["cmix_out"], work["cmix_tmp"])
+        ops.cmix_sparse_down_relu_one_vtile_hfma2_split2_into(work["cmix_hid"], z[p + "ffn.value.weight.sparse"], work["cmix_out"])
         return work["cmix_x"], work["cmix_out"].view(1, 1, self.C), v
 
 

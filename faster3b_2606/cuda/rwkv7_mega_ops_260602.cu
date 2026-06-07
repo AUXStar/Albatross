@@ -235,20 +235,20 @@ __global__ void lnx_rkvres_xg_kernel(
 }
 
 
-__global__ void zero_float_kernel(float* __restrict__ out, int64_t n) {
+__global__ void zero_vec4_kernel(half* __restrict__ out, int64_t n_vec4) {
     int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = 0.0f;
+    if (i < n_vec4) {
+        reinterpret_cast<int4*>(out)[i] = make_int4(0, 0, 0, 0);
     }
 }
 
 
-__global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_down_relu_one_f32acc_vtile_kernel(
+__global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_down_relu_one_vtile_hfma2_split2_kernel(
     int C,
     const half* __restrict__ preact,
     const half* __restrict__ value_weight_tiled,
-    float* __restrict__ tmp) {
-    __shared__ __align__(256) float vec_slice[FFN_TILE];
+    half* __restrict__ out) {
+    __shared__ __align__(256) half vec_slice[FFN_TILE];
     __shared__ __align__(256) int nnz_ids[FFN_TILE];
     __shared__ int nnz_count;
     __shared__ int warp_counts[FFN_TILE / 32];
@@ -261,17 +261,17 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_down_relu_one
     int warp_id = tid >> 5;
     int start_f = f_block * FFN_TILE;
 
-    float relu2 = 0.0f;
+    half relu2_h = __float2half_rn(0.0f);
     if (tid < FFN_TILE) {
         float v = fmaxf(__half2float(preact[start_f + tid]), 0.0f);
-        relu2 = v * v;
-        vec_slice[tid] = relu2;
+        relu2_h = __float2half_rn(v * v);
+        vec_slice[tid] = relu2_h;
     }
 
     bool nonzero = false;
     int local_pos = 0;
     if (tid < FFN_TILE) {
-        nonzero = relu2 != 0.0f;
+        nonzero = bool(__half_as_ushort(relu2_h) << 1);
         unsigned mask = __ballot_sync(0xffffffffu, nonzero);
         local_pos = __popc(mask & ((1u << lane) - 1u));
         if (lane == 0) {
@@ -296,35 +296,28 @@ __global__ __launch_bounds__(FFN_SPMV_THREADS, 4) void cmix_sparse_down_relu_one
     }
     __syncthreads();
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
+    half2 acc0;
+    half2 acc1;
+    *reinterpret_cast<int*>(&acc0) = 0;
+    *reinterpret_cast<int*>(&acc1) = 0;
     constexpr int C_TILE = 2 * FFN_SPMV_THREADS;
     int c_blocks = C / C_TILE;
     int c0 = c_block * C_TILE + tid * 2;
     int tile_base = ((f_block * c_blocks + c_block) * FFN_TILE) * C_TILE;
-    for (int i = 0; i < nnz_count; ++i) {
-        int local_f = nnz_ids[i];
-        float2 mat = __half22float2(*reinterpret_cast<const half2*>(
-            value_weight_tiled + static_cast<int64_t>(tile_base) + local_f * C_TILE + tid * 2));
-        float v = vec_slice[local_f];
-        acc0 = fmaf(v, mat.x, acc0);
-        acc1 = fmaf(v, mat.y, acc1);
+    for (int i = 0; i < nnz_count; i += 2) {
+        int local_f0 = nnz_ids[i];
+        half2 mat0 = *reinterpret_cast<const half2*>(
+            value_weight_tiled + static_cast<int64_t>(tile_base) + local_f0 * C_TILE + tid * 2);
+        acc0 = __hfma2(__half2half2(vec_slice[local_f0]), mat0, acc0);
+        if (i + 1 < nnz_count) {
+            int local_f1 = nnz_ids[i + 1];
+            half2 mat1 = *reinterpret_cast<const half2*>(
+                value_weight_tiled + static_cast<int64_t>(tile_base) + local_f1 * C_TILE + tid * 2);
+            acc1 = __hfma2(__half2half2(vec_slice[local_f1]), mat1, acc1);
+        }
     }
-    atomicAdd(tmp + c0, acc0);
-    atomicAdd(tmp + c0 + 1, acc1);
-}
-
-
-__global__ void f32_to_f16_vec_kernel(
-    const float* __restrict__ tmp,
-    half* __restrict__ out,
-    int64_t pairs) {
-    int64_t pair_idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (pair_idx < pairs) {
-        float v0 = tmp[pair_idx * 2];
-        float v1 = tmp[pair_idx * 2 + 1];
-        reinterpret_cast<half2*>(out)[pair_idx] = __floats2half2_rn(v0, v1);
-    }
+    half2 acc = __hadd2(acc0, acc1);
+    atomicAdd(reinterpret_cast<half2*>(out + c0), acc);
 }
 
 
@@ -685,6 +678,108 @@ __device__ __forceinline__ void rkv_executor_tile_body(
             out[row0 + j] = __float2half_rn(sum);
         }
     }
+}
+
+
+template <int THREADS>
+__device__ __forceinline__ void rkv_executor_tile_body_h2stage_hfma2_splitacc_k2pipe(
+    const half* __restrict__ xr,
+    const half* __restrict__ xk,
+    const half* __restrict__ xv,
+    const half* __restrict__ wr,
+    const half* __restrict__ wk,
+    const half* __restrict__ wv,
+    half* __restrict__ yr,
+    half* __restrict__ yk,
+    half* __restrict__ yv,
+    int task,
+    int C) {
+    constexpr int RKV_OUT_TILE = 2;
+    __shared__ float partial[THREADS / 32][RKV_OUT_TILE];
+    int rows_per_group = C / RKV_OUT_TILE;
+    int group = task / rows_per_group;
+    int row0 = (task - group * rows_per_group) * RKV_OUT_TILE;
+    const half* inp = group == 0 ? xr : (group == 1 ? xk : xv);
+    const half* wt = group == 0 ? wr : (group == 1 ? wk : wv);
+    half* out = group == 0 ? yr : (group == 1 ? yk : yv);
+
+    half2 acc00h;
+    half2 acc01h;
+    half2 acc10h;
+    half2 acc11h;
+    *reinterpret_cast<int*>(&acc00h) = 0;
+    *reinterpret_cast<int*>(&acc01h) = 0;
+    *reinterpret_cast<int*>(&acc10h) = 0;
+    *reinterpret_cast<int*>(&acc11h) = 0;
+    for (int k0 = threadIdx.x << 1; k0 < C; k0 += THREADS << 2) {
+        const int k1 = k0 + (THREADS << 1);
+        const half* w00 = wt + static_cast<int64_t>(row0) * C + k0;
+        const half* w10 = w00 + C;
+        half2 hx0 = *reinterpret_cast<const half2*>(inp + k0);
+        half2 hw00 = *reinterpret_cast<const half2*>(w00);
+        half2 hw10 = *reinterpret_cast<const half2*>(w10);
+        if (k1 < C) {
+            const half* w01 = wt + static_cast<int64_t>(row0) * C + k1;
+            const half* w11 = w01 + C;
+            half2 hx1 = *reinterpret_cast<const half2*>(inp + k1);
+            half2 hw01 = *reinterpret_cast<const half2*>(w01);
+            half2 hw11 = *reinterpret_cast<const half2*>(w11);
+            acc00h = __hfma2(hx0, hw00, acc00h);
+            acc01h = __hfma2(hx1, hw01, acc01h);
+            acc10h = __hfma2(hx0, hw10, acc10h);
+            acc11h = __hfma2(hx1, hw11, acc11h);
+        } else {
+            acc00h = __hfma2(hx0, hw00, acc00h);
+            acc10h = __hfma2(hx0, hw10, acc10h);
+        }
+    }
+
+    float2 acc0f = __half22float2(__hadd2(acc00h, acc01h));
+    float2 acc1f = __half22float2(__hadd2(acc10h, acc11h));
+    float acc0 = acc0f.x + acc0f.y;
+    float acc1 = acc1f.x + acc1f.y;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    float v0 = warp_sum(acc0);
+    float v1 = warp_sum(acc1);
+    if (lane == 0) {
+        partial[warp][0] = v0;
+        partial[warp][1] = v1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+#pragma unroll
+        for (int widx = 0; widx < THREADS / 32; ++widx) {
+            sum0 += partial[widx][0];
+            sum1 += partial[widx][1];
+        }
+        out[row0] = __float2half_rn(sum0);
+        out[row0 + 1] = __float2half_rn(sum1);
+    }
+}
+
+
+template <int THREADS>
+__device__ __forceinline__ void rkv_executor_tile_body_h2stage_hfma2_splitacc_k2pipe_group_interleave(
+    const half* __restrict__ xr,
+    const half* __restrict__ xk,
+    const half* __restrict__ xv,
+    const half* __restrict__ wr,
+    const half* __restrict__ wk,
+    const half* __restrict__ wv,
+    half* __restrict__ yr,
+    half* __restrict__ yk,
+    half* __restrict__ yv,
+    int task,
+    int C) {
+    constexpr int RKV_OUT_TILE = 2;
+    int rows_per_group = C / RKV_OUT_TILE;
+    int row_pair = task / 3;
+    int group = task - row_pair * 3;
+    int mapped_task = group * rows_per_group + row_pair;
+    rkv_executor_tile_body_h2stage_hfma2_splitacc_k2pipe<THREADS>(xr, xk, xv, wr, wk, wv, yr, yk, yv, mapped_task, C);
 }
 
 template <int THREADS>
@@ -1111,7 +1206,8 @@ __global__ __launch_bounds__(THREADS, MIN_BLOCKS) void rkv_lowrank_pre_executor_
         }
     } else {
         for (int task = worker_rank; task < rkv_tasks; task += worker_count) {
-            rkv_executor_tile_body<THREADS, RKV_OUT_TILE>(xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
+            rkv_executor_tile_body_h2stage_hfma2_splitacc_k2pipe_group_interleave<THREADS>(
+                xr, xk, xv, wr, wk, wv, yr, yk, yv, task, C);
             if (needs_task_sync) {
                 __syncthreads();
             }
@@ -1597,22 +1693,18 @@ void rwkv7_mega_row1_linear_exact4_vec4_threads_tile_into_cuda(torch::Tensor x, 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void rwkv7_mega_cmix_sparse_down_relu_one_f32acc_vtile_into_cuda(torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out, torch::Tensor tmp) {
+void rwkv7_mega_cmix_sparse_down_relu_one_vtile_hfma2_split2_into_cuda(torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out) {
     int64_t F64 = preact.size(0);
     int64_t C64 = value_weight.size(1);
     auto stream = at::cuda::getCurrentCUDAStream();
-    zero_float_kernel<<<static_cast<unsigned int>((C64 + 255) / 256), 256, 0, stream>>>(
-        reinterpret_cast<float*>(tmp.data_ptr<float>()),
-        C64);
-    cmix_sparse_down_relu_one_f32acc_vtile_kernel<<<dim3(static_cast<unsigned int>(F64 / FFN_TILE), static_cast<unsigned int>(C64 / (2 * FFN_SPMV_THREADS)), 1), FFN_SPMV_THREADS, 0, stream>>>(
+    zero_vec4_kernel<<<static_cast<unsigned int>(((C64 / 8) + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
+        C64 / 8);
+    cmix_sparse_down_relu_one_vtile_hfma2_split2_kernel<<<dim3(static_cast<unsigned int>(F64 / FFN_TILE), static_cast<unsigned int>(C64 / (2 * FFN_SPMV_THREADS)), 1), FFN_SPMV_THREADS, 0, stream>>>(
         static_cast<int>(C64),
         reinterpret_cast<const half*>(preact.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(value_weight.data_ptr<at::Half>()),
-        reinterpret_cast<float*>(tmp.data_ptr<float>()));
-    f32_to_f16_vec_kernel<<<static_cast<unsigned int>(((C64 / 2) + 255) / 256), 256, 0, stream>>>(
-        reinterpret_cast<const float*>(tmp.data_ptr<float>()),
-        reinterpret_cast<half*>(out.data_ptr<at::Half>()),
-        C64 / 2);
+        reinterpret_cast<half*>(out.data_ptr<at::Half>()));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

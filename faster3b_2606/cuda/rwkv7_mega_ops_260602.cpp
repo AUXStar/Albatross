@@ -9,7 +9,7 @@ void rwkv7_mega_lnx_rkvres_xg_into_cuda(torch::Tensor x, torch::Tensor r, torch:
 void rwkv7_mega_row1_linear_exact4_into_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor y);
 void rwkv7_mega_add_ln_cmix_mix_into_cuda(torch::Tensor x, torch::Tensor residual, torch::Tensor shift_state, torch::Tensor weight, torch::Tensor bias, torch::Tensor x_k, torch::Tensor x_out, torch::Tensor mixed, double eps, int64_t threads);
 void rwkv7_mega_row1_linear_exact4_vec4_threads_tile_into_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor y, int64_t threads, int64_t out_tile);
-void rwkv7_mega_cmix_sparse_down_relu_one_f32acc_vtile_into_cuda(torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out, torch::Tensor tmp);
+void rwkv7_mega_cmix_sparse_down_relu_one_vtile_hfma2_split2_into_cuda(torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out);
 void rwkv7_mega_add_last_layer_norm_f16_into_cuda(torch::Tensor x, torch::Tensor residual, torch::Tensor weight, torch::Tensor bias, torch::Tensor out, double eps);
 
 TORCH_LIBRARY(rwkv7_mega_ops_260602, m) {
@@ -22,7 +22,7 @@ TORCH_LIBRARY(rwkv7_mega_ops_260602, m) {
     m.def("row1_linear_exact4_into(Tensor x, Tensor w, Tensor(a!) y) -> ()");
     m.def("add_ln_cmix_mix_into(Tensor x, Tensor residual, Tensor(a!) shift_state, Tensor weight, Tensor bias, Tensor x_k, Tensor(b!) x_out, Tensor(c!) mixed, float eps, int threads) -> ()");
     m.def("row1_linear_exact4_vec4_threads_tile_into(Tensor x, Tensor w, Tensor(a!) y, int threads, int out_tile) -> ()");
-    m.def("cmix_sparse_down_relu_one_f32acc_vtile_into(Tensor preact, Tensor value_weight, Tensor(a!) out, Tensor(b!) tmp) -> ()");
+    m.def("cmix_sparse_down_relu_one_vtile_hfma2_split2_into(Tensor preact, Tensor value_weight, Tensor(a!) out) -> ()");
     m.def("add_last_layer_norm_f16_into(Tensor x, Tensor residual, Tensor weight, Tensor bias, Tensor(a!) out, float eps) -> ()");
 }
 
@@ -54,8 +54,8 @@ TORCH_LIBRARY_IMPL(rwkv7_mega_ops_260602, CUDA, m) {
     m.impl("row1_linear_exact4_vec4_threads_tile_into", [](torch::Tensor x, torch::Tensor w, torch::Tensor y, int64_t threads, int64_t out_tile) {
         rwkv7_mega_row1_linear_exact4_vec4_threads_tile_into_cuda(x, w, y, threads, out_tile);
     });
-    m.impl("cmix_sparse_down_relu_one_f32acc_vtile_into", [](torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out, torch::Tensor tmp) {
-        rwkv7_mega_cmix_sparse_down_relu_one_f32acc_vtile_into_cuda(preact, value_weight, out, tmp);
+    m.impl("cmix_sparse_down_relu_one_vtile_hfma2_split2_into", [](torch::Tensor preact, torch::Tensor value_weight, torch::Tensor out) {
+        rwkv7_mega_cmix_sparse_down_relu_one_vtile_hfma2_split2_into_cuda(preact, value_weight, out);
     });
     m.impl("add_last_layer_norm_f16_into", [](torch::Tensor x, torch::Tensor residual, torch::Tensor weight, torch::Tensor bias, torch::Tensor out, double eps) {
         rwkv7_mega_add_last_layer_norm_f16_into_cuda(x, residual, weight, bias, out, eps);
