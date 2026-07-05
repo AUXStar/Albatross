@@ -216,16 +216,23 @@ def is_orig_linear_weight(key: str) -> bool:
 
 def load_extensions(wkv_mode: str = "fp16") -> None:
     t0 = time.perf_counter()
-    log(f"loading CUDA extensions v3a_ops + fast_ops + wkv={wkv_mode}")
+    log(f"loading CUDA extensions v3a_ops + fast_ops + int8_ops + wkv={wkv_mode}")
     cuda_flags = ["-O3", "--use_fast_math", "--extra-device-vectorization"] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
-    load(name="rwkv7_v3a_ops", sources=[str(CUDA_DIR / "rwkv7_v3a_ops.cpp"), str(CUDA_DIR / "rwkv7_v3a_ops.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
-    load(name="rwkv7_fast_ops_fp16", sources=[str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"), str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
+    exts = [
+        ("rwkv7_v3a_ops", [str(CUDA_DIR / "rwkv7_v3a_ops.cpp"), str(CUDA_DIR / "rwkv7_v3a_ops.cu")], {"extra_cuda_cflags": cuda_flags}),
+        ("rwkv7_fast_ops_fp16", [str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"), str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu")], {"extra_cuda_cflags": cuda_flags}),
+        ("rwkv7_int8_ops", [str(CUDA_DIR / "rwkv7_int8_ops.cpp"), str(CUDA_DIR / "rwkv7_int8_ops.cu")], {"extra_cuda_cflags": cuda_flags}),
+    ]
     if wkv_mode == "fp16":
-        load(name="rwkv7_wkv_fp16_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas", "-O3"])
+        exts.append(("rwkv7_wkv_fp16_v2", [str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cu")], {"extra_cuda_cflags": ["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas", "-O3"]}))
     elif wkv_mode == "fp32io16":
-        load(name="rwkv7_wkv_fp32_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3", "-D_IO_FP16_"], extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas", "-O3", "-D_IO_FP16_"])
+        exts.append(("rwkv7_wkv_fp32_v2", [str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp32_v2.cu")], {"extra_cflags": ["-O3", "-D_IO_FP16_"], "extra_cuda_cflags": ["-O3", "--use_fast_math", "-Xptxas", "-O3", "-D_IO_FP16_"]}))
     else:
         raise ValueError(f"unknown wkv_mode: {wkv_mode}")
+    for name, sources, extra in exts:
+        te = time.perf_counter()
+        load(name=name, sources=sources, is_python_module=False, verbose=False, extra_cflags=extra.get("extra_cflags", ["-O3"]), **{k: v for k, v in extra.items() if k != "extra_cflags"})
+        log(f"  {name}: {time.perf_counter() - te:.3f}s")
     log(f"CUDA extensions loaded in {time.perf_counter() - t0:.3f}s")
 
 class RWKV7:
@@ -263,6 +270,16 @@ class RWKV7:
             value = z[key].squeeze()
             dev = key_device(key)
             is_lowrank = is_lowrank_weight(key)
+
+            # 离线量化的 int8 权重：保持 int8，只移到 GPU
+            if value.dtype == torch.int8:
+                z[key] = value.to(device=dev).contiguous()
+                continue
+            # scale 张量：1D [N] fp16，移到 GPU，不转置
+            if key.endswith("_scale"):
+                z[key] = value.to(device=dev, dtype=DTYPE).contiguous()
+                continue
+
             if ".ffn.key.weight" in key and CMIX_SPARSE == "auto":
                 z[key + ".fc"] = value.to(device=dev, dtype=DTYPE).contiguous()
             if (
@@ -286,6 +303,12 @@ class RWKV7:
                     z[key + ".t"] = value.t().contiguous()
             else:
                 z[key] = value
+        # INT8 模型不走 rkv 融合路径（rkv 需要 fp16 权重）
+        has_int8_att = z["blocks.0.att.receptance.weight"].dtype == torch.int8
+        if not has_int8_att and RKV_MODE != "off" and not use_orig_linear("att_c2c"):
+            for layer in range(L):
+                p = f"blocks.{layer}.att."
+                z[p+"rkv.weight"] = torch.stack((z[p+"receptance.weight"], z[p+"key.weight"], z[p+"value.weight"])).contiguous()
         emb_dev = first_device()
         ln0_w_bf16 = ln0_w_src.to(device=emb_dev).contiguous()
         ln0_b_bf16 = ln0_b_src.to(device=emb_dev).contiguous()
@@ -302,13 +325,14 @@ class RWKV7:
                     chunk = torch.ops.rwkv7_v3a_ops.emb_ln0_bf16_to_f16(chunk, ln0_w_bf16, ln0_b_bf16)
                     emb[start:end].copy_(chunk)
             z["emb.weight"] = emb
-        if RKV_MODE != "off" and not use_orig_linear("att_c2c"):
-            for layer in range(L):
-                p = f"blocks.{layer}.att."
-                z[p+"rkv.weight"] = torch.stack((z[p+"receptance.weight"], z[p+"key.weight"], z[p+"value.weight"])).contiguous()
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # INT8 权重→scale 的快速查找表
+        self.int8_scales: dict[int, torch.Tensor] = {}
+        for key, val in z.items():
+            if key.endswith("_scale") and z.get(key[:-6], torch.tensor(0)).dtype == torch.int8:
+                self.int8_scales[id(z[key[:-6]])] = val
         sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
         log(cuda_mem())
@@ -605,18 +629,78 @@ class RWKV7:
         return self.linear(k, z[p+"value.weight"])
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """线性层。INT8 权重 CUDA dequant 后走原版 fp16 路径。"""
+        if weight.dtype == torch.int8:
+            scale = self.int8_scales.get(id(weight))
+            if scale is not None:
+                # CUDA dequant int8 [N,K] → fp16 [K,N]
+                weight = torch.ops.rwkv7_int8_ops.dequant_int8_to_f16(weight, scale, True)
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
         return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
-        if not use_orig_linear("head"):
-            return self.linear(x, z["head.weight"])
+        weight = z["head.weight"]
+        # int8 head 走 linear_orig_layout（int8 dispatch 在那里）
+        if not use_orig_linear("head") and weight.dtype != torch.int8:
+            return self.linear(x, weight)
         rows = x.numel() // C
-        return self.linear_orig_layout(x, z["head.weight"], PathConfig(rows, False, CMIX_DENSE), "head")
+        return self.linear_orig_layout(x, weight, PathConfig(rows, False, CMIX_DENSE), "head")
+
+    def _int8_rows_tile(self, rows: int) -> tuple[int, int]:
+        """选择 INT8 GEMM kernel 的 RowTile/OutTile 参数
+        4-wide K 循环下 OutTile=4 寄存器压力大：
+          M=4 OT=4: 78 regs, M=8 OT=4: 106 regs, M=8 OT=2: 87 regs
+        微基准+端到端验证：
+          M=4: OT=4 快（16.86 vs 18.74 ms）
+          M=8: OT=2 快（24.66 vs 27.40 ms）
+        """
+        if rows <= 4:
+            return 4, 4
+        if rows <= 8:
+            return 8, 2
+        if rows <= 16:
+            return 16, 2
+        return 16, 4
 
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
+        # INT8 orig 权重：rows 1/2 走 int8 exact kernel（1:1 对应原版参数选择）
+        # rows>2 dequant 到 fp16，走原版 fp16 dispatch
+        if weight.dtype == torch.int8:
+            scale = self.int8_scales[id(weight)]
+            xc = x.contiguous()
+            if path.rows == 1:
+                if group == "ffn_key":
+                    use4 = True if C == 2560 else (C <= 1024)
+                else:
+                    use4 = (group != "att_c2c" or C < 2048)
+                return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 128, 2, use4)
+            if path.rows == 2:
+                if group == "att_c2c":
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 64, 2, True)
+                if group == "ffn_key":
+                    if C == 2560:
+                        return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 128, 2, False)
+                    if C < 4096:
+                        return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 64, 2, True)
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 128, 2, False)
+                if group == "head" and C == 2560:
+                    return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 128, 2, False)
+                return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_exact_f16(xc, weight, scale, 64, 2, True)
+            # rows > 2: 混合策略
+            #   att_c2c/head rows <= 16: INT8 direct kernel（微基准 M=16 时比 dequant+cuBLAS 快）
+            #   ffn_key rows <= 12: INT8 direct kernel（ffn_key M=16 时 cuBLAS 更快）
+            #   超过阈值: dequant → cuBLAS
+            int8_thresh = 16 if group in ("att_c2c", "head") else 12
+            if path.rows <= int8_thresh:
+                rt, ot = self._int8_rows_tile(path.rows)
+                return torch.ops.rwkv7_int8_ops.linear_int8_orig_rows_f16(xc, weight, scale, rt, ot)
+            if use_orig_linear(group):
+                weight = torch.ops.rwkv7_int8_ops.dequant_int8_to_f16(weight, scale, False)  # [N,K] fp16 orig
+            else:
+                weight = torch.ops.rwkv7_int8_ops.dequant_int8_to_f16(weight, scale, True)   # [K,N] fp16 non-orig
+        # 原版 fp16 路径完全不动
         if not use_orig_linear(group):
             return self.linear(x, weight)
         if path.rows == 1:
