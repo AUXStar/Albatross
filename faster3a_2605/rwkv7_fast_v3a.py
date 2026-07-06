@@ -216,10 +216,11 @@ def is_orig_linear_weight(key: str) -> bool:
 
 def load_extensions(wkv_mode: str = "fp16") -> None:
     t0 = time.perf_counter()
-    log(f"loading CUDA extensions v3a_ops + fast_ops + wkv={wkv_mode}")
+    log(f"loading CUDA extensions v3a_ops + fast_ops + nf4_ops + wkv={wkv_mode}")
     cuda_flags = ["-O3", "--use_fast_math", "--extra-device-vectorization"] + ([] if os.name == "nt" else ["-Xptxas", "-O3"])
     load(name="rwkv7_v3a_ops", sources=[str(CUDA_DIR / "rwkv7_v3a_ops.cpp"), str(CUDA_DIR / "rwkv7_v3a_ops.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
     load(name="rwkv7_fast_ops_fp16", sources=[str(CUDA_DIR / "rwkv7_fast_ops_fp16.cpp"), str(CUDA_DIR / "rwkv7_fast_ops_fp16.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
+    load(name="rwkv7_nf4_ops", sources=[str(CUDA_DIR / "rwkv7_nf4_ops.cpp"), str(CUDA_DIR / "rwkv7_nf4_ops.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags)
     if wkv_mode == "fp16":
         load(name="rwkv7_wkv_fp16_v2", sources=[str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cpp"), str(CUDA_DIR / "rwkv7_wkv_fp16_v2.cu")], is_python_module=False, verbose=False, extra_cflags=["-O3"], extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas", "-O3"])
     elif wkv_mode == "fp32io16":
@@ -262,11 +263,16 @@ class RWKV7:
                 continue
             value = z[key].squeeze()
             dev = key_device(key)
+            # NF4: uint8 weights stay uint8, .nf4_b_scale goes as fp16
+            is_nf4_weight = value.dtype == torch.uint8 and key.endswith(".weight")
+            is_nf4_scale = key.endswith(".nf4_b_scale")
             is_lowrank = is_lowrank_weight(key)
             if ".ffn.key.weight" in key and CMIX_SPARSE == "auto":
                 z[key + ".fc"] = value.to(device=dev, dtype=DTYPE).contiguous()
             if (
                 not is_lowrank
+                and not is_nf4_weight
+                and not is_nf4_scale
                 and (("key.weight" in key and not is_orig_linear_weight(key))
                 or ("value.weight" in key and not is_orig_linear_weight(key))
                 or ("receptance.weight" in key and not is_orig_linear_weight(key))
@@ -274,7 +280,12 @@ class RWKV7:
                 or ("head.weight" in key and not is_orig_linear_weight(key)))
             ):
                 value = value.t()
-            value = value.to(device=dev, dtype=DTYPE).contiguous()
+            if is_nf4_weight:
+                value = value.to(device=dev).contiguous()
+            elif is_nf4_scale:
+                value = value.to(device=dev, dtype=DTYPE).contiguous()
+            else:
+                value = value.to(device=dev, dtype=DTYPE).contiguous()
             if key.endswith("att.r_k"):
                 value = value.flatten().contiguous()
             if is_lowrank:
@@ -309,6 +320,13 @@ class RWKV7:
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        # NF4: build block scale lookup table (weight id -> b_scale tensor)
+        self.nf4_block_scales: dict[int, torch.Tensor] = {}
+        for key, val in z.items():
+            if key.endswith(".nf4_b_scale"):
+                base_key = key[:-len(".nf4_b_scale")]
+                if base_key in z:
+                    self.nf4_block_scales[id(z[base_key])] = val
         sync_all()
         log(f"model ready in {time.perf_counter() - t0:.3f}s L={L} C={C} H={H} N={N} V={V}")
         log(cuda_mem())
@@ -581,36 +599,69 @@ class RWKV7:
         B, T, _ = x.shape
 
         if path.cmix_mode == CMIX_B1T1_SPARSE:
-            return ops.cmix_sparse_one(C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
+            vw = self._dequant_nf4_value(z[p+"value.weight"])
+            return ops.cmix_sparse_one(C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], vw)
         if path.cmix_mode == CMIX_ROWS2_SPARSE:
-            return ops.cmix_sparse_rows(B, T, C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], z[p+"value.weight"])
+            vw = self._dequant_nf4_value(z[p+"value.weight"])
+            return ops.cmix_sparse_rows(B, T, C, z[p+"key.weight.fc"].size(0), x.contiguous(), shift_state[1], z[p+"x_k"], z[p+"key.weight.fc"], vw)
 
         mixed = ops.cmix_mix(B, T, C, x.contiguous(), shift_state[1], z[p+"x_k"])
         return self.cmix_from_mixed(mixed, p, path)
+
+    def _dequant_nf4_value(self, vw: torch.Tensor) -> torch.Tensor:
+        """Dequant NF4 value.weight to fp16 for non-NF4 cmix paths (auto mode)."""
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(vw))
+            if b_scale is not None:
+                return torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(vw, b_scale, False)
+        return vw
 
     def cmix_from_mixed(self, mixed: torch.Tensor, p: str, path: PathConfig) -> torch.Tensor:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
         B, T, _ = mixed.shape
         hid = self.linear_orig_layout(mixed, z[p+"key.weight"], path, "ffn_key")
+        vw = z[p+"value.weight"]
+        # NF4 value.weight: dispatch to NF4 cmix_sparse kernels
+        if vw.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales[id(vw)]
+            nf4_ops = torch.ops.rwkv7_nf4_ops
+            F = vw.size(0)
+            if path.cmix_mode == CMIX_B1T1_NOFC:
+                return nf4_ops.cmix_sparse_down_relu_one_nf4(hid.view(-1).contiguous(), vw, b_scale, C, F)
+            if path.cmix_mode == CMIX_ROWS2_NOFC:
+                if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
+                    return nf4_ops.cmix_sparse_down_relu_rows_t512_nf4(hid.contiguous(), vw, b_scale, B, T, C, F)
+                return nf4_ops.cmix_sparse_down_relu_rows_nf4(hid.contiguous(), vw, b_scale, B, T, C, F)
+            # dense path: dequant + cuBLAS
+            k = ops.relu_square(hid.contiguous())
+            return self.linear(k, vw)
+        # FP16 value.weight: original path
         if path.cmix_mode == CMIX_B1T1_NOFC:
-            return ops.cmix_sparse_down_relu_one(C, z[p+"value.weight"].size(0), hid.view(-1).contiguous(), z[p+"value.weight"])
+            return ops.cmix_sparse_down_relu_one(C, vw.size(0), hid.view(-1).contiguous(), vw)
         if path.cmix_mode == CMIX_ROWS2_NOFC:
-            F = z[p+"value.weight"].size(0)
+            F = vw.size(0)
             if path.rows >= CMIX_NOFC_T512_MIN_ROWS and C % 512 == 0 and F % 512 == 0:
-                return ops.cmix_sparse_down_relu_rows_t512(B, T, C, F, hid.contiguous(), z[p+"value.weight"])
-            return ops.cmix_sparse_down_relu_rows(B, T, C, F, hid.contiguous(), z[p+"value.weight"])
+                return ops.cmix_sparse_down_relu_rows_t512(B, T, C, F, hid.contiguous(), vw)
+            return ops.cmix_sparse_down_relu_rows(B, T, C, F, hid.contiguous(), vw)
 
         k = ops.relu_square(hid.contiguous())
-        return self.linear(k, z[p+"value.weight"])
+        return self.linear(k, vw)
 
     def linear(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(weight))
+            if b_scale is not None:
+                weight = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(weight, b_scale, True)
         if x.numel() == x.size(-1) and weight.size(1) % 64 == 0:
             return torch.ops.rwkv7_v3a_ops.linear_f16_m1_splitk(x.contiguous(), weight)
         return torch.ops.rwkv7_v3a_ops.linear_f16(x.contiguous(), weight)
 
     def linear_head(self, x: torch.Tensor) -> torch.Tensor:
         z = self.z
+        if z["head.weight"].dtype == torch.uint8:
+            rows = x.numel() // C
+            return self.linear_orig_layout(x, z["head.weight"], PathConfig(rows, False, CMIX_DENSE), "head")
         if not use_orig_linear("head"):
             return self.linear(x, z["head.weight"])
         rows = x.numel() // C
@@ -619,6 +670,37 @@ class RWKV7:
     def linear_orig_layout(self, x: torch.Tensor, weight: torch.Tensor, path: PathConfig, group: str) -> torch.Tensor:
         if not use_orig_linear(group):
             return self.linear(x, weight)
+        # NF4 dispatch: uint8 weight -> NF4 kernel (same dispatch params as v3a FP16)
+        if weight.dtype == torch.uint8:
+            b_scale = self.nf4_block_scales.get(id(weight))
+            assert b_scale is not None, f"NF4 weight has no block scale (id={id(weight)})"
+            if path.rows == 1:
+                if group == "ffn_key":
+                    if C == 2560:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, True)
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, C <= 1024)
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, group != "att_c2c" or C < 2048)
+            if path.rows == 2:
+                if group == "att_c2c":
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 64, 2, True)
+                if group == "ffn_key":
+                    if C == 2560:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, False)
+                    if C < 4096:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 64, 2, True)
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, False)
+                if group == "head" and C == 2560:
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 128, 2, False)
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_exact_f16(x.contiguous(), weight, b_scale, 64, 2, True)
+            # M>=3: use NF4 GEMM kernel for small M, dequant+cuBLAS for large M
+            if path.rows <= 12:
+                if group == "att_c2c":
+                    if C <= 1024:
+                        return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, 2, 2)
+                    return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, 3, 2)
+                return torch.ops.rwkv7_nf4_ops.linear_nf4_orig_rows_f16(x.contiguous(), weight, b_scale, 2, 4)
+            # Large M: dequant to fp16 and fall through to cuBLAS
+            weight = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(weight, b_scale, False)
         if path.rows == 1:
             if group == "ffn_key":
                 if C == 2560:
