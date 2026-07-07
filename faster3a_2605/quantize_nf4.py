@@ -26,6 +26,7 @@ import time
 import torch
 
 # 量化的权重后缀（和 INT8 相同，全部是 orig 组）
+# head.weight 不量化：LM head 必须保持高精度，否则强化学习会训崩
 NF4_KEYS = (
     ".att.receptance.weight",
     ".att.key.weight",
@@ -33,7 +34,6 @@ NF4_KEYS = (
     ".att.output.weight",
     ".ffn.key.weight",
     ".ffn.value.weight",
-    "head.weight",
 )
 
 BLOCK_SIZE = 16
