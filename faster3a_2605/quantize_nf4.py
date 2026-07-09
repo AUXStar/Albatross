@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """
-RWKV-7 v3a 离线 NF4 (E2M1) 量化工具
+RWKV-7 v3a 离线 NVFP4 量化工具
 
-将 FP16 模型量化为 NF4 (4-bit float E2M1)，输出新的 .pth 文件。
-推理引擎加载量化后的模型时，根据权重 dtype (uint8) 自动选择 NF4 kernel。
+将 FP16 模型量化为 NVFP4 (E2M1 + E4M3 block scale + FP32 tensor scale)，
+输出新的 .pth 文件。
+推理引擎加载量化后的模型时，根据权重 dtype (uint8) 自动选择 NVFP4 kernel。
+
+NVFP4 格式 (NVIDIA 官方标准):
+  - 权重: E2M1 4-bit float, 值集 {0,±0.5,±1,±1.5,±2,±3,±4,±6}
+  - 块缩放: E4M3 FP8, 每 16 个元素共享一个 (torch.float8_e4m3fn)
+  - 张量缩放: FP32 标量, 每个权重矩阵一个
+  - 反量化: value = e2m1[code] * b_scale_e4m3 * t_scale
 
 量化策略：
-  - per-block symmetric E2M1（block_size=16, scale = max_abs(block) / 6.0）
+  - per-block NVFP4（block_size=16）
   - 量化 orig 组大矩阵（att.r/k/v/o, ffn.key, ffn.value, head）
-  - ffn.value.weight 量化后走 NF4 cmix_sparse 内核
+  - ffn.value.weight 量化后走 NVFP4 cmix_sparse 内核
   - 低秩权重不量化（收益小）
   - Embedding / LN / r_k 不量化
 
 用法：
-  python3 quantize_nf4.py --model model.pth --out model-nf4.pth
-  python3 quantize_nf4.py --model model.pth --out model-nf4.pth --verify
+  python3 quantize_nf4.py --model model.pth --out model-nvfp4.pth
+  python3 quantize_nf4.py --model model.pth --out model-nvfp4.pth --verify
 """
 
 import argparse
@@ -45,14 +52,15 @@ E2M1_VALUES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
 
-def quantize_weight_nf4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """per-block E2M1 量化。
+def quantize_weight_nf4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """per-block NVFP4 量化 (E2M1 + E4M3 block scale + FP32 tensor scale)。
 
     Args:
         w: [N, K] fp16/fp32 权重
     Returns:
         w_nf4:   [N, K/2] uint8 (packed, 2 E2M1 per byte)
-        b_scale: [N, K/16] fp16 (per-block scale)
+        b_scale: [N, K/16] float8_e4m3fn (per-block E4M3 scale)
+        t_scale: float32 (per-tensor FP32 scale)
     """
     N, K = w.shape
     assert K % BLOCK_SIZE == 0, f"K={K} must be divisible by BLOCK_SIZE={BLOCK_SIZE}"
@@ -66,10 +74,20 @@ def quantize_weight_nf4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     max_abs = torch.clamp(max_abs, min=1e-10)
 
     # Block scale = max_abs / 6.0 (E2M1 max value = 6.0)
-    b_scale = (max_abs / 6.0).squeeze(-1)  # [N, K/16]
+    b_scale_fp32 = (max_abs / 6.0).squeeze(-1)  # [N, K/16]
 
-    # Normalize to [-6, 6] range (关键：除以 b_scale，不是 max_abs)
-    normalized = blocks / b_scale.unsqueeze(-1)  # [N, K/16, 16], range [-6, 6]
+    # Per-tensor FP32 scale = global max of all block scales
+    t_scale = b_scale_fp32.max().item()
+    t_scale = max(t_scale, 1e-10)
+
+    # Normalize block scale by t_scale, then quantize to E4M3
+    b_scale_norm = b_scale_fp32 / t_scale  # [N, K/16], range [0, 1]
+    b_scale = b_scale_norm.to(torch.float8_e4m3fn)  # [N, K/16]
+
+    # Normalize weights: blocks / max_abs -> [-1, 1] -> E2M1 encode
+    # (E2M1 values are [-6, 6], so dividing by max_abs normalizes to [-1, 1],
+    #  and the actual value = e2m1[code] * 6.0 * max_abs = e2m1[code] * b_scale_fp32)
+    normalized = blocks / max_abs  # [-1, 1]
 
     # Quantize to E2M1 codes
     codes = _e2m1_quantize(normalized)  # [N, K/16, 16], uint8 (0-15)
@@ -80,19 +98,22 @@ def quantize_weight_nf4(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # Pack 2 codes per byte: even index -> low nibble, odd index -> high nibble
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)  # [N, K/2]
 
-    return packed.to(torch.uint8).contiguous(), b_scale.to(torch.float16).contiguous()
+    return packed.to(torch.uint8).contiguous(), b_scale.contiguous(), t_scale
 
 
 def _e2m1_quantize(normalized: torch.Tensor) -> torch.Tensor:
     """Vectorized E2M1 quantization.
 
     Args:
-        normalized: [...] float, range [-6, 6]
+        normalized: [...] float, range [-1, 1]
     Returns:
         codes: [...] uint8 (4-bit codes, 0-15)
     """
-    sign_bit = (normalized < 0).to(torch.uint8)  # 1=negative
-    abs_w = normalized.abs()
+    # E2M1 values are [0, 0.5, 1, 1.5, 2, 3, 4, 6] for positive,
+    # normalized input is [-1, 1], so we scale by 6 to get [-6, 6] for E2M1
+    scaled = normalized * 6.0  # [-6, 6]
+    sign_bit = (scaled < 0).to(torch.uint8)  # 1=negative
+    abs_w = scaled.abs()
 
     # bucketize: 0->0.0, 1->0.5, 2->1.0, ..., 7->6.0
     idx = torch.bucketize(abs_w, E2M1_BOUNDS)  # 0-7
@@ -102,12 +123,13 @@ def _e2m1_quantize(normalized: torch.Tensor) -> torch.Tensor:
     return codes
 
 
-def _e2m1_dequant(w_nf4: torch.Tensor, b_scale: torch.Tensor) -> torch.Tensor:
-    """反量化 NF4 -> float32（用于验证）。
+def _e2m1_dequant(w_nf4: torch.Tensor, b_scale: torch.Tensor, t_scale: float = 1.0) -> torch.Tensor:
+    """反量化 NVFP4 -> float32（用于验证）。
 
     Args:
         w_nf4:   [N, K/2] uint8 (packed)
-        b_scale: [N, K/16] fp16
+        b_scale: [N, K/16] float8_e4m3fn
+        t_scale: float32 (per-tensor scale)
     Returns:
         deq: [N, K] float32
     """
@@ -127,8 +149,8 @@ def _e2m1_dequant(w_nf4: torch.Tensor, b_scale: torch.Tensor) -> torch.Tensor:
     )
     values = e2m1_lut[codes]  # [N, K]
 
-    # Apply block scale: expand [N, K/16] -> [N, K]
-    bs = b_scale.float().repeat_interleave(BLOCK_SIZE, dim=1)
+    # Apply block scale (E4M3 -> float32) and tensor scale (FP32)
+    bs = b_scale.float().repeat_interleave(BLOCK_SIZE, dim=1) * t_scale
 
     return values * bs
 
@@ -167,17 +189,18 @@ def quantize_model(input_path: str, output_path: str, verify: bool = False) -> N
         total_params += value.numel()
 
         if should_quantize(key) and value.dim() == 2:
-            w_nf4, b_scale = quantize_weight_nf4(value)
+            w_nf4, b_scale, t_scale = quantize_weight_nf4(value)
 
             if verify:
-                deq = _e2m1_dequant(w_nf4, b_scale)
+                deq = _e2m1_dequant(w_nf4, b_scale, t_scale)
                 cos = cosine_similarity_fp64(value.float().flatten(), deq.flatten())
-                print(f"  {key}: CosSim={cos:.6f}")
+                print(f"  {key}: CosSim={cos:.6f} t_scale={t_scale:.6f}")
                 del deq
 
             # in-place 替换
             src[key] = w_nf4
             src[key + ".nf4_b_scale"] = b_scale
+            src[key + ".nvfp4_t_scale"] = torch.tensor(t_scale, dtype=torch.float32)
             del value
             quantized_count += 1
             quantized_params += src[key].numel() * 2
@@ -221,7 +244,7 @@ def quantize_model(input_path: str, output_path: str, verify: bool = False) -> N
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RWKV-7 v3a 离线 NF4 (E2M1) 量化工具")
+    parser = argparse.ArgumentParser(description="RWKV-7 v3a 离线 NVFP4 量化工具")
     parser.add_argument("--model", required=True, help="输入 FP16 模型路径")
     parser.add_argument("--out", required=True, help="输出 NF4 模型路径")
     parser.add_argument("--verify", action="store_true", help="量化后验证 CosSim")
