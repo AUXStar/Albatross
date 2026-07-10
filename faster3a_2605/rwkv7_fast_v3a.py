@@ -524,6 +524,30 @@ class RWKV7:
         x = self.embed(tokens)
         return self.forward_from_x(x, state, path, last_indices=last_indices)
 
+    def _linear_rkv(self, xr: torch.Tensor, xk: torch.Tensor, xv: torch.Tensor, p: str, path: PathConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute r, k, v — uses fused NVFP4 kernel for T=1 decode, else 3 separate calls."""
+        z = self.z
+        w_r = z[p+"receptance.weight"]
+        if False and w_r.dtype == torch.uint8 and path.rows == 1:
+            w_k = z[p+"key.weight"]
+            w_v = z[p+"value.weight"]
+            bs_r = self.nf4_block_scales[id(w_r)]
+            bs_k = self.nf4_block_scales[id(w_k)]
+            bs_v = self.nf4_block_scales[id(w_v)]
+            ts_r = self.nf4_t_scales.get(id(w_r), 1.0)
+            ts_k = self.nf4_t_scales.get(id(w_k), 1.0)
+            ts_v = self.nf4_t_scales.get(id(w_v), 1.0)
+            rkv = torch.ops.rwkv7_nf4_ops.linear_nvfp4_rkv_orig_row1_blk16_f16(
+                xr.contiguous(), xk.contiguous(), xv.contiguous(),
+                w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, 2)
+            B, T = xr.shape[0], xr.shape[1]
+            N = w_r.size(0)
+            return rkv[0].view(B, T, N), rkv[1].view(B, T, N), rkv[2].view(B, T, N)
+        r = self.linear_orig_layout(xr, w_r, path, "att_c2c")
+        k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
+        v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+        return r, k, v
+
     def tmix(self, layer: int, x: torch.Tensor, shift_state: torch.Tensor, wkv_state: torch.Tensor, elapsed_t: torch.Tensor, v_first: torch.Tensor, p: str, path: PathConfig, pre_mix=None) -> tuple[torch.Tensor, torch.Tensor]:
         z = self.z
         ops = torch.ops.rwkv7_fast_ops_fp16
@@ -532,24 +556,12 @@ class RWKV7:
             xr, xw, xk, xv, xa, xg = pre_mix
         else:
             xr, xw, xk, xv, xa, xg = ops.tmix_mix6(B, T, C, x.contiguous(), shift_state[0], z[p+"x_r"], z[p+"x_w"], z[p+"x_k"], z[p+"x_v"], z[p+"x_a"], z[p+"x_g"])
-        if pre_mix is not None:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+        if path.use_batched_rkv:
+            flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
+            rkv = torch.bmm(flat, z[p+"rkv.weight"])
+            r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
         else:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+            r, k, v = self._linear_rkv(xr, xk, xv, p, path)
 
         v1 = None
         if LOWRANK_WEIGHT != "orig" and can_use_lowrank_fused(path.rows) and can_use_lowrank_out_fused(path.rows) and layer != 0:

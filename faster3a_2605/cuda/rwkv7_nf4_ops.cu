@@ -539,6 +539,87 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
 }
 
 // ═══════════════════════════════════════════════════════════════
+// FUSED: 3-way r/k/v M=1 GEMV — single kernel launch for r, k, v
+// blockIdx.z selects which of r/k/v to compute (0=r, 1=k, 2=v)
+// Eliminates 2 kernel launches per layer
+// ═══════════════════════════════════════════════════════════════
+template <int OutTile>
+__global__ __launch_bounds__(32, 1) void linear_nvfp4_rkv_orig_row1_blk16_f16_kernel(
+    int K, int N,
+    const dtype* __restrict__ x_r,
+    const dtype* __restrict__ x_k,
+    const dtype* __restrict__ x_v,
+    const uint8_t* __restrict__ w_r,
+    const uint8_t* __restrict__ w_k,
+    const uint8_t* __restrict__ w_v,
+    const __nv_fp8_e4m3* __restrict__ bs_r,
+    const __nv_fp8_e4m3* __restrict__ bs_k,
+    const __nv_fp8_e4m3* __restrict__ bs_v,
+    float ts_r, float ts_k, float ts_v,
+    dtype* __restrict__ y_r,
+    dtype* __restrict__ y_k,
+    dtype* __restrict__ y_v) {
+  // Select pointers based on blockIdx.z (uniform across warp — no divergence)
+  const dtype* x;
+  const uint8_t* w_nf4;
+  const __nv_fp8_e4m3* b_scale;
+  float t_scale;
+  dtype* y;
+  if (blockIdx.z == 0) { x = x_r; w_nf4 = w_r; b_scale = bs_r; t_scale = ts_r; y = y_r; }
+  else if (blockIdx.z == 1) { x = x_k; w_nf4 = w_k; b_scale = bs_k; t_scale = ts_k; y = y_k; }
+  else { x = x_v; w_nf4 = w_v; b_scale = bs_v; t_scale = ts_v; y = y_v; }
+
+  const int n0 = blockIdx.x * OutTile;
+  const int KB = K >> 4;
+  const int K2 = K >> 1;
+  float acc[OutTile];
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    acc[j] = 0.0f;
+  }
+  for (int kb = threadIdx.x; kb < KB; kb += 32) {
+    const int k = kb << 4;
+    const float2 x0 = __half22float2(*reinterpret_cast<const __half2*>(x + k));
+    const float2 x1 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 2));
+    const float2 x2 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 4));
+    const float2 x3 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 6));
+    const float2 x4 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 8));
+    const float2 x5 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 10));
+    const float2 x6 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 12));
+    const float2 x7 = __half22float2(*reinterpret_cast<const __half2*>(x + k + 14));
+#pragma unroll
+    for (int j = 0; j < OutTile; ++j) {
+      const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+      const uint2 packed = *reinterpret_cast<const uint2*>(
+          w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
+      acc[j] = fmaf(x0.x, e2m1_decode_f(packed.x & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x0.y, e2m1_decode_f((packed.x >> 4) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x1.x, e2m1_decode_f((packed.x >> 8) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x1.y, e2m1_decode_f((packed.x >> 12) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x2.x, e2m1_decode_f((packed.x >> 16) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x2.y, e2m1_decode_f((packed.x >> 20) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x3.x, e2m1_decode_f((packed.x >> 24) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x3.y, e2m1_decode_f(packed.x >> 28) * bs, acc[j]);
+      acc[j] = fmaf(x4.x, e2m1_decode_f(packed.y & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x4.y, e2m1_decode_f((packed.y >> 4) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x5.x, e2m1_decode_f((packed.y >> 8) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x5.y, e2m1_decode_f((packed.y >> 12) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x6.x, e2m1_decode_f((packed.y >> 16) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x6.y, e2m1_decode_f((packed.y >> 20) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x7.x, e2m1_decode_f((packed.y >> 24) & 0xF) * bs, acc[j]);
+      acc[j] = fmaf(x7.y, e2m1_decode_f(packed.y >> 28) * bs, acc[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < OutTile; ++j) {
+    const float v = warp_sum(acc[j]);
+    if (threadIdx.x == 0) {
+      y[n0 + j] = __float2half_rn(v);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // OPTIMIZED: M=2 GEMV — 16-wide block kernel (uint2 vectorized load)
 // Same approach as M=1 but with 2 accumulation sets
 // ═══════════════════════════════════════════════════════════════
@@ -671,6 +752,43 @@ at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda_impl(at::Tensor x, at::Tensor w
       w_nf4.data_ptr<uint8_t>(), reinterpret_cast<const __nv_fp8_e4m3*>(b_scale.data_ptr()),
       static_cast<float>(t_scale),
       reinterpret_cast<dtype*>(y.data_ptr()));
+  return y;
+}
+
+// Fused 3-way r/k/v GEMV: single launch for r, k, v (M=1, NVFP4)
+template <int OutTile>
+at::Tensor linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl(
+    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v,
+    at::Tensor w_r, at::Tensor w_k, at::Tensor w_v,
+    at::Tensor bs_r, at::Tensor bs_k, at::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v) {
+  const int64_t k64 = x_r.size(-1);
+  const int64_t n64 = w_r.size(0);
+  TORCH_CHECK(k64 <= INT_MAX && n64 <= INT_MAX, "linear_nvfp4_rkv K/N too large");
+  TORCH_CHECK((n64 % OutTile) == 0, "linear_nvfp4_rkv requires N divisible by out_tile");
+  TORCH_CHECK((k64 % 16) == 0, "linear_nvfp4_rkv blk16 requires K divisible by 16");
+  const int K = static_cast<int>(k64);
+  const int N = static_cast<int>(n64);
+  TORCH_CHECK(x_k.size(-1) == K && x_v.size(-1) == K, "rkv x K mismatch");
+  TORCH_CHECK(w_k.size(0) == N && w_v.size(0) == N, "rkv w N mismatch");
+  TORCH_CHECK(w_r.size(1) == K / 2 && w_k.size(1) == K / 2 && w_v.size(1) == K / 2, "rkv w K/2 mismatch");
+  TORCH_CHECK(bs_r.size(0) == N && bs_r.size(1) == K / 16, "rkv bs_r shape mismatch");
+  TORCH_CHECK(bs_k.size(0) == N && bs_k.size(1) == K / 16, "rkv bs_k shape mismatch");
+  TORCH_CHECK(bs_v.size(0) == N && bs_v.size(1) == K / 16, "rkv bs_v shape mismatch");
+  auto y = at::empty({3, N}, x_r.options());
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dtype* y_ptr = reinterpret_cast<dtype*>(y.data_ptr());
+  linear_nvfp4_rkv_orig_row1_blk16_f16_kernel<OutTile><<<dim3(N / OutTile, 1, 3), 32, 0, stream>>>(
+      K, N,
+      reinterpret_cast<const dtype*>(x_r.data_ptr()),
+      reinterpret_cast<const dtype*>(x_k.data_ptr()),
+      reinterpret_cast<const dtype*>(x_v.data_ptr()),
+      w_r.data_ptr<uint8_t>(), w_k.data_ptr<uint8_t>(), w_v.data_ptr<uint8_t>(),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_r.data_ptr()),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_k.data_ptr()),
+      reinterpret_cast<const __nv_fp8_e4m3*>(bs_v.data_ptr()),
+      static_cast<float>(ts_r), static_cast<float>(ts_k), static_cast<float>(ts_v),
+      y_ptr, y_ptr + N, y_ptr + 2 * N);
   return y;
 }
 
@@ -1244,6 +1362,17 @@ at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda(
   if (out_tile == 1) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<1>(x, w_nf4, b_scale, t_scale);
   if (out_tile == 2) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<2>(x, w_nf4, b_scale, t_scale);
   TORCH_CHECK(false, "unsupported linear_nvfp4_orig_row1_blk16 out_tile");
+}
+
+// Fused r/k/v entry point
+at::Tensor linear_nvfp4_rkv_orig_row1_blk16_f16_cuda(
+    at::Tensor x_r, at::Tensor x_k, at::Tensor x_v,
+    at::Tensor w_r, at::Tensor w_k, at::Tensor w_v,
+    at::Tensor bs_r, at::Tensor bs_k, at::Tensor bs_v,
+    double ts_r, double ts_k, double ts_v, int64_t out_tile) {
+  if (out_tile == 1) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<1>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  if (out_tile == 2) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<2>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  TORCH_CHECK(false, "unsupported linear_nvfp4_rkv_orig_row1_blk16 out_tile");
 }
 
 at::Tensor linear_nvfp4_orig_row2_blk16_f16_cuda(
