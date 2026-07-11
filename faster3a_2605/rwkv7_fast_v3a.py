@@ -528,7 +528,7 @@ class RWKV7:
         """Compute r, k, v — uses fused NVFP4 kernel for T=1 decode, else 3 separate calls."""
         z = self.z
         w_r = z[p+"receptance.weight"]
-        if False and w_r.dtype == torch.uint8 and path.rows == 1:
+        if w_r.dtype == torch.uint8 and path.rows == 1:
             w_k = z[p+"key.weight"]
             w_v = z[p+"value.weight"]
             bs_r = self.nf4_block_scales[id(w_r)]
@@ -602,16 +602,20 @@ class RWKV7:
                 v12 = self.linear_rank_out(self.linear_rank_in(xv, z.get(p+"v1"), z.get(p+"v1.t"), path.rows), z.get(p+"v2"), z.get(p+"v2.t"), path.rows)
                 v = ops.tmix_vres_gate(B, T, C, v.contiguous(), v_first.contiguous(), z[p+"v0"], v12.contiguous())
 
+        y_wkv = torch.empty_like(r)
         y = torch.empty_like(r)
-        if WKV_MODE == "fp32io16":
-            w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
-            torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y)
-        elif T <= 16:
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
+        if os.environ.get("WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
+            torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
         else:
-            w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
-            torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y, elapsed_t)
-        y = ops.tmix_lnx_rkvres_xg(B, T, C, H, y.contiguous(), r.contiguous(), k.contiguous(), v.contiguous(), z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous())
+            if WKV_MODE == "fp32io16":
+                w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
+                torch.ops.rwkv7_wkv_fp32_v2.forward(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv)
+            elif T <= 16:
+                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t)
+            else:
+                w_raw = ops.add_vec(C, w.contiguous(), z[p+"w0"])
+                torch.ops.rwkv7_wkv_fp16_v2.wkv_seq(B, T, C, H, wkv_state, r.contiguous(), w_raw.contiguous(), k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t)
+            y = ops.tmix_lnx_rkvres_xg(B, T, C, H, y_wkv.contiguous(), r.contiguous(), k.contiguous(), v.contiguous(), z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous())
         return self.linear_orig_layout(y, z[p+"output.weight"], path, "att_c2c"), v_first
 
     def cmix(self, x: torch.Tensor, shift_state: torch.Tensor, p: str, path: PathConfig) -> torch.Tensor:

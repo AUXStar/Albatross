@@ -163,6 +163,162 @@ __global__ void __launch_bounds__(CLONE_N, 2) wkv_fp16_v1_clone_kernel(
   }
 }
 
+// Warp-level float reduction for fused LayerNorm (same as tmix_lnx_rkvres_xg)
+__device__ __forceinline__ float warp_sum_f32(float v) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v += __shfl_down_sync(0xffffffffu, v, offset);
+  }
+  return v;
+}
+
+// Fused WKV + lnx_rkvres_xg kernel for T=1 decode.
+// Computes WKV attention, then directly applies LayerNorm + r*k*r_k + vres + gate
+// without writing y to HBM and reading it back.
+// r[], k[] in shared memory and vv/y2 in registers are reused from WKV computation.
+template <bool AddW0 = false>
+__global__ __launch_bounds__(CLONE_N, 2) void wkv_fp16_v1_clone_lnx_kernel(
+    const int B,
+    const int T,
+    const int C,
+    const int H,
+    F* __restrict__ state_ptr,
+    const F* __restrict__ r_ptr,
+    const F* __restrict__ w_ptr,
+    const F* __restrict__ w0_ptr,
+    const F* __restrict__ k_ptr,
+    const F* __restrict__ v_ptr,
+    const F* __restrict__ a_ptr,
+    const F* __restrict__ b_ptr,
+    F* __restrict__ y_ptr,
+    const int* __restrict__ elapsed_t,
+    const F* __restrict__ r_k_ptr,
+    const F* __restrict__ ln_w_ptr,
+    const F* __restrict__ ln_b_ptr,
+    const F* __restrict__ g_ptr,
+    F* __restrict__ out_ptr) {
+  __builtin_assume(T == 1);
+  const int b = blockIdx.x / H;
+  const int h = blockIdx.x % H;
+  const int i = threadIdx.x;
+  const int lane = i % 32;
+  const int warp_id = i >> 5;
+  const int warp_lane = i & 31;
+
+  __shared__ __align__(256) half2 state_smem[CLONE_N][CLONE_N / 2];
+
+  state_ptr += b * C * CLONE_N + h * CLONE_N * CLONE_N;
+  constexpr int ldg_size = sizeof(int4) / sizeof(F);
+#pragma unroll
+  for (int j0 = 0; j0 < CLONE_N / ldg_size; j0++) {
+    int4 state_vec = ((int4*)state_ptr)[j0 * CLONE_N + i];
+#pragma unroll
+    for (int j1 = 0; j1 < ldg_size / 2; j1++) {
+      int row = j0 * ldg_size + i * ldg_size / CLONE_N;
+      int col = i * ldg_size % CLONE_N / 2 + j1;
+      state_smem[row][(row % 32) ^ col] = ((half2*)&state_vec)[j1];
+    }
+  }
+  __syncthreads();
+
+  half2 state[CLONE_N / 2];
+#pragma unroll
+  for (int j = 0; j < CLONE_N / 2; j++) {
+    state[j] = state_smem[i][lane ^ j];
+  }
+
+  __shared__ __align__(128) half2 r[CLONE_N / 2], k[CLONE_N / 2], w[CLONE_N / 2], a[CLONE_N / 2], bvec[CLONE_N / 2];
+  __shared__ float lnx_partial[2];
+
+  // === WKV computation (T=1, single iteration) ===
+  int t = b * T * C + h * CLONE_N;
+  __syncthreads();
+  clone_cp_async<4>((half2*)(i < 32 ? w : a) + lane, (half2*)((i < 32 ? w_ptr : a_ptr) + t) + lane, true);
+  clone_cp_commit();
+  clone_cp_async<4>((half2*)(i < 32 ? r : k) + lane, (half2*)((i < 32 ? r_ptr : k_ptr) + t) + lane, true);
+  clone_cp_async<4>((half2*)bvec + lane, (half2*)(b_ptr + t) + lane, i < 32);
+  clone_cp_commit();
+
+  half vv = v_ptr[t + i];
+  half2 vv2 = {vv, vv};
+  half2 y2 = {0.0, 0.0};
+  half2 sa2 = {0.0, 0.0};
+  clone_cp_wait<1>();
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < CLONE_N / 2; j++) {
+    sa2 = __hfma2(a[j], state[j], sa2);
+  }
+  half sa = sa2.x + sa2.y;
+  sa2 = {sa, sa};
+  ((F*)w)[i] = w_delta_maybe_w0<AddW0>(((F*)w)[i], w0_ptr, h * CLONE_N + i, elapsed_t[b] + h * CLONE_N + i);
+
+  clone_cp_wait<0>();
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < CLONE_N / 2; j++) {
+    half2& s = state[j];
+    s = __hfma2(s, w[j], __hfma2(k[j], vv2, __hfma2(sa2, bvec[j], s)));
+    y2 = __hfma2(s, r[j], y2);
+  }
+  y_ptr[t + i] = y2.x + y2.y;
+
+  // === FUSED LNX: LayerNorm + rkv dot + gate ===
+  float yv = y2.x + y2.y;
+
+  // LayerNorm: mean
+  float sum = warp_sum_f32(yv);
+  if (warp_lane == 0) lnx_partial[warp_id] = sum;
+  __syncthreads();
+  float mean = (lnx_partial[0] + lnx_partial[1]) * (1.0f / 64.0f);
+  __syncthreads();
+
+  // LayerNorm: variance + rstd
+  float d = yv - mean;
+  float ss = d * d;
+  ss = warp_sum_f32(ss);
+  if (warp_lane == 0) lnx_partial[warp_id] = ss;
+  __syncthreads();
+  float var = (lnx_partial[0] + lnx_partial[1]) * (1.0f / 64.0f);
+  float rstd = rsqrtf(var + 64.0e-5f);
+  __syncthreads();
+
+  // rkv dot: r * k * r_k (warp-level reduction)
+  float rv = __half2float(((F*)r)[i]);
+  float kv = __half2float(((F*)k)[i]);
+  float vv_f = __half2float(vv);
+  int c = h * CLONE_N + i;
+  float dot = rv * kv * __half2float(r_k_ptr[c]);
+  dot = warp_sum_f32(dot);
+  if (warp_lane == 0) lnx_partial[warp_id] = dot;
+  __syncthreads();
+  float rkv = lnx_partial[0] + lnx_partial[1];
+  __syncthreads();
+
+  // Final: (d * rstd * weight + bias + rkv * v) * g
+  float out_val = (d * rstd * __half2float(ln_w_ptr[c]) + __half2float(ln_b_ptr[c]) + rkv * vv_f)
+                  * __half2float(g_ptr[t + i]);
+  out_ptr[t + i] = __float2half_rn(out_val);
+
+  // === State writeback (same as clone kernel) ===
+#pragma unroll
+  for (int j = 0; j < CLONE_N / 2; j++) {
+    state_smem[i][lane ^ j] = state[j];
+  }
+  __syncthreads();
+#pragma unroll
+  for (int j0 = 0; j0 < CLONE_N / ldg_size; j0++) {
+    int4 state_vec;
+#pragma unroll
+    for (int j1 = 0; j1 < ldg_size / 2; j1++) {
+      int row = j0 * ldg_size + i * ldg_size / CLONE_N;
+      int col = i * ldg_size % CLONE_N / 2 + j1;
+      ((half2*)&state_vec)[j1] = state_smem[row][(row % 32) ^ col];
+    }
+    ((int4*)state_ptr)[j0 * CLONE_N + i] = state_vec;
+  }
+}
+
 template <int Bytes>
 __device__ __forceinline__ void cp_async(void* smem, const void* global, bool pred) {
   static_assert(Bytes == 16 || Bytes == 8 || Bytes == 4);
@@ -617,6 +773,27 @@ void wkv_one_v2_cuda_impl(
     at::Tensor y,
     at::Tensor elapsed_t);
 
+void wkv_lnx_seq_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    at::Tensor state,
+    at::Tensor r,
+    at::Tensor w,
+    at::Tensor w0,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor y,
+    at::Tensor elapsed_t,
+    at::Tensor r_k,
+    at::Tensor ln_weight,
+    at::Tensor ln_bias,
+    at::Tensor g,
+    at::Tensor out);
+
 void wkv_seq_v2_cuda_impl(
     int B,
     int T,
@@ -732,6 +909,48 @@ void wkv_seq_w0_v2_cuda(
     at::Tensor y,
     at::Tensor elapsed_t) {
   wkv_seq_v2_cuda_impl(B, T, C, H, state, r, w, reinterpret_cast<const half*>(w0.data_ptr()), true, k, v, a, b, y, elapsed_t);
+}
+
+void wkv_lnx_seq_w0_v2_cuda(
+    int B,
+    int T,
+    int C,
+    int H,
+    at::Tensor state,
+    at::Tensor r,
+    at::Tensor w,
+    at::Tensor w0,
+    at::Tensor k,
+    at::Tensor v,
+    at::Tensor a,
+    at::Tensor b,
+    at::Tensor y,
+    at::Tensor elapsed_t,
+    at::Tensor r_k,
+    at::Tensor ln_weight,
+    at::Tensor ln_bias,
+    at::Tensor g,
+    at::Tensor out) {
+  assert(T == 1);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  wkv_fp16_v1_clone_lnx_kernel<true><<<dim3(B * H), dim3(CLONE_N), 0, stream>>>(
+      B, 1, C, H,
+      reinterpret_cast<half*>(state.data_ptr()),
+      reinterpret_cast<const half*>(r.data_ptr()),
+      reinterpret_cast<const half*>(w.data_ptr()),
+      reinterpret_cast<const half*>(w0.data_ptr()),
+      reinterpret_cast<const half*>(k.data_ptr()),
+      reinterpret_cast<const half*>(v.data_ptr()),
+      reinterpret_cast<const half*>(a.data_ptr()),
+      reinterpret_cast<const half*>(b.data_ptr()),
+      reinterpret_cast<half*>(y.data_ptr()),
+      elapsed_t.data_ptr<int>(),
+      reinterpret_cast<const half*>(r_k.data_ptr()),
+      reinterpret_cast<const half*>(ln_weight.data_ptr()),
+      reinterpret_cast<const half*>(ln_bias.data_ptr()),
+      reinterpret_cast<const half*>(g.data_ptr()),
+      reinterpret_cast<half*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void wkv_one_v2_cuda(
