@@ -589,7 +589,9 @@ class RWKV7:
             w = self.linear_rank_out_act(w1, z.get(p+"w2"), z.get(p+"w2.t"), path.rows, 1)
             a = self.linear_rank_out(a1, z.get(p+"a2"), z.get(p+"a2.t"), path.rows)
             g = self.linear_rank_out_act(g1, z.get(p+"g2"), z.get(p+"g2.t"), path.rows, 2)
-        k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
+        use_kkag_fuse = os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2
+        if not use_kkag_fuse:
+            k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
 
         if layer == 0:
             v_first = v
@@ -604,7 +606,9 @@ class RWKV7:
 
         y_wkv = torch.empty_like(r)
         y = torch.empty_like(r)
-        if os.environ.get("WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
+        if os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
+            torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_kkag_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"], y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
+        elif os.environ.get("WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
             torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
         else:
             if WKV_MODE == "fp32io16":
