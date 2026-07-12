@@ -604,7 +604,7 @@ class RWKV7:
             ts_v = self.nf4_t_scales.get(id(w_v), 1.0)
             rkv = torch.ops.rwkv7_nf4_ops.linear_nvfp4_rkv_orig_row1_blk16_f16(
                 xr.contiguous(), xk.contiguous(), xv.contiguous(),
-                w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, 2)
+                w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v, 4)
             B, T = xr.shape[0], xr.shape[1]
             N = w_r.size(0)
             return rkv[0].view(B, T, N), rkv[1].view(B, T, N), rkv[2].view(B, T, N)
@@ -783,7 +783,7 @@ class RWKV7:
             t_scale = self.nf4_t_scales.get(id(weight), 1.0)
             if path.rows == 1:
                 # Optimized blk16 GEMV: uint2 vectorized, 1-warp, always K%16==0
-                return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row1_blk16_f16(x.contiguous(), weight, b_scale, t_scale, 2)
+                return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row1_blk16_f16(x.contiguous(), weight, b_scale, t_scale, 4)
             if path.rows == 2:
                 return torch.ops.rwkv7_nf4_ops.linear_nvfp4_orig_row2_blk16_f16(x.contiguous(), weight, b_scale, t_scale, 2)
             # M>=3: use NVFP4 GEMM kernel for small M, dequant+cuBLAS for large M

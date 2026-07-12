@@ -474,16 +474,14 @@ __global__ void dequant_nf4_to_f16_kernel(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OPTIMIZED v2: M=1 GEMV — shared mem byte→__half2 LUT + __hfma2
+// OPTIMIZED v3: M=1 GEMV — dual-block parallel iteration
 //
-// Key optimizations vs v1:
-// 1. 256-entry shared memory LUT: byte → __half2 (two E2M1 values packed)
-//    Eliminates 16 bitwise e2m1_decode_f calls → 8 shared mem reads
-// 2. __hfma2 block accumulation: 8 __hfma2 instead of 16 fmaf (2x FMA throughput)
-// 3. Block scale applied once per block (not per element): 1 fmaf vs 16 fmul
-// 4. FP32 cross-block accumulation preserves precision
-//
-// Compute per block per output: ~18 ops (vs 112 in v1) = 6.2x reduction
+// Key optimizations vs v2:
+// 1. Process 2 K-blocks per iteration with independent accumulators
+//    → 2 independent dependency chains, warp scheduler can overlap loads/computes
+// 2. Shared mem LUT + __hfma2 (from v2)
+// 3. Step by 64 instead of 32, each iter handles blocks kb and kb+32
+//    Requires KB % 2 == 0 (true for all RWKV: C is power of 2, KB = C/16)
 // ═══════════════════════════════════════════════════════════════
 template <int OutTile>
 __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel(
@@ -514,38 +512,106 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
   for (int j = 0; j < OutTile; ++j) {
     acc[j] = 0.0f;
   }
-  for (int kb = threadIdx.x; kb < KB; kb += 32) {
-    const int k = kb << 4;
-    // Load x as 8 __half2 values (16 elements)
-    const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
-    const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
-    const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
+
+  // Dual-block: process kb and kb+KB/2 per iteration
+  // This gives 2 independent dependency chains for ILP
+  const int half_KB = KB >> 1;
+  for (int kb = threadIdx.x; kb < half_KB; kb += 32) {
+    // ── Block A: kb ──
+    const int kA = kb << 4;
+    const __half2* xA = reinterpret_cast<const __half2*>(x + kA);
+    const __half2 xA0 = xA[0], xA1 = xA[1], xA2 = xA[2], xA3 = xA[3];
+    const __half2 xA4 = xA[4], xA5 = xA[5], xA6 = xA[6], xA7 = xA[7];
+
+    // ── Block B: kb + half_KB ──
+    const int kB = (kb + half_KB) << 4;
+    const __half2* xB = reinterpret_cast<const __half2*>(x + kB);
+    const __half2 xB0 = xB[0], xB1 = xB[1], xB2 = xB[2], xB3 = xB[3];
+    const __half2 xB4 = xB[4], xB5 = xB[5], xB6 = xB[6], xB7 = xB[7];
+
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
-      const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
-      const uint2 packed = *reinterpret_cast<const uint2*>(
+      // Block A
+      const float bsA = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+      const uint2 pkA = *reinterpret_cast<const uint2*>(
           w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
-      // Decode 16 weights as 8 __half2 pairs via LUT
-      const __half2 wv0 = byte_lut[packed.x & 0xFF];
-      const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
-      const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
-      const __half2 wv3 = byte_lut[packed.x >> 24];
-      const __half2 wv4 = byte_lut[packed.y & 0xFF];
-      const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
-      const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
-      const __half2 wv7 = byte_lut[packed.y >> 24];
-      // FP16 block accumulation: 8 __hfma2 = 16 FMA in 8 instructions
-      __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
-      acc_h = __hfma2(wv1, xv1, acc_h);
-      acc_h = __hfma2(wv2, xv2, acc_h);
-      acc_h = __hfma2(wv3, xv3, acc_h);
-      acc_h = __hfma2(wv4, xv4, acc_h);
-      acc_h = __hfma2(wv5, xv5, acc_h);
-      acc_h = __hfma2(wv6, xv6, acc_h);
-      acc_h = __hfma2(wv7, xv7, acc_h);
-      // Convert block sum to FP32 and apply block scale
-      const float2 bs_sum = __half22float2(acc_h);
-      acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
+      const __half2 wA0 = byte_lut[pkA.x & 0xFF];
+      const __half2 wA1 = byte_lut[(pkA.x >> 8) & 0xFF];
+      const __half2 wA2 = byte_lut[(pkA.x >> 16) & 0xFF];
+      const __half2 wA3 = byte_lut[pkA.x >> 24];
+      const __half2 wA4 = byte_lut[pkA.y & 0xFF];
+      const __half2 wA5 = byte_lut[(pkA.y >> 8) & 0xFF];
+      const __half2 wA6 = byte_lut[(pkA.y >> 16) & 0xFF];
+      const __half2 wA7 = byte_lut[pkA.y >> 24];
+      __half2 accA = __hfma2(wA0, xA0, __float2half2_rn(0.0f));
+      accA = __hfma2(wA1, xA1, accA);
+      accA = __hfma2(wA2, xA2, accA);
+      accA = __hfma2(wA3, xA3, accA);
+      accA = __hfma2(wA4, xA4, accA);
+      accA = __hfma2(wA5, xA5, accA);
+      accA = __hfma2(wA6, xA6, accA);
+      accA = __hfma2(wA7, xA7, accA);
+
+      // Block B (independent chain — can execute while A waits for memory)
+      const float bsB = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb + half_KB]) * t_scale;
+      const uint2 pkB = *reinterpret_cast<const uint2*>(
+          w_nf4 + static_cast<int64_t>(n0 + j) * K2 + ((kb + half_KB) << 3));
+      const __half2 wB0 = byte_lut[pkB.x & 0xFF];
+      const __half2 wB1 = byte_lut[(pkB.x >> 8) & 0xFF];
+      const __half2 wB2 = byte_lut[(pkB.x >> 16) & 0xFF];
+      const __half2 wB3 = byte_lut[pkB.x >> 24];
+      const __half2 wB4 = byte_lut[pkB.y & 0xFF];
+      const __half2 wB5 = byte_lut[(pkB.y >> 8) & 0xFF];
+      const __half2 wB6 = byte_lut[(pkB.y >> 16) & 0xFF];
+      const __half2 wB7 = byte_lut[pkB.y >> 24];
+      __half2 accB = __hfma2(wB0, xB0, __float2half2_rn(0.0f));
+      accB = __hfma2(wB1, xB1, accB);
+      accB = __hfma2(wB2, xB2, accB);
+      accB = __hfma2(wB3, xB3, accB);
+      accB = __hfma2(wB4, xB4, accB);
+      accB = __hfma2(wB5, xB5, accB);
+      accB = __hfma2(wB6, xB6, accB);
+      accB = __hfma2(wB7, xB7, accB);
+
+      // Merge A+B into FP32 accumulator
+      const float2 sumA = __half22float2(accA);
+      const float2 sumB = __half22float2(accB);
+      acc[j] = fmaf(sumA.x + sumA.y, bsA, acc[j]);
+      acc[j] = fmaf(sumB.x + sumB.y, bsB, acc[j]);
+    }
+  }
+  // Handle odd KB (shouldn't happen for RWKV, but be safe)
+  if (KB & 1) {
+    const int kb = threadIdx.x + half_KB * 2;
+    if (kb < KB) {
+      const int k = kb << 4;
+      const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
+      const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
+      const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
+#pragma unroll
+      for (int j = 0; j < OutTile; ++j) {
+        const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+        const uint2 packed = *reinterpret_cast<const uint2*>(
+            w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
+        const __half2 wv0 = byte_lut[packed.x & 0xFF];
+        const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
+        const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
+        const __half2 wv3 = byte_lut[packed.x >> 24];
+        const __half2 wv4 = byte_lut[packed.y & 0xFF];
+        const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
+        const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
+        const __half2 wv7 = byte_lut[packed.y >> 24];
+        __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
+        acc_h = __hfma2(wv1, xv1, acc_h);
+        acc_h = __hfma2(wv2, xv2, acc_h);
+        acc_h = __hfma2(wv3, xv3, acc_h);
+        acc_h = __hfma2(wv4, xv4, acc_h);
+        acc_h = __hfma2(wv5, xv5, acc_h);
+        acc_h = __hfma2(wv6, xv6, acc_h);
+        acc_h = __hfma2(wv7, xv7, acc_h);
+        const float2 bs_sum = __half22float2(acc_h);
+        acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
+      }
     }
   }
 #pragma unroll
@@ -558,9 +624,9 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_orig_row1_blk16_f16_kernel
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FUSED v2: 3-way r/k/v M=1 GEMV — single kernel launch for r, k, v
+// FUSED v3: 3-way r/k/v M=1 GEMV — dual-block parallel iteration
 // blockIdx.z selects which of r/k/v to compute (0=r, 1=k, 2=v)
-// Uses shared mem byte→__half2 LUT + __hfma2 (same optimization as row1)
+// Uses shared mem byte→__half2 LUT + __hfma2 + dual-block ILP
 // ═══════════════════════════════════════════════════════════════
 template <int OutTile>
 __global__ __launch_bounds__(32, 1) void linear_nvfp4_rkv_orig_row1_blk16_f16_kernel(
@@ -607,38 +673,105 @@ __global__ __launch_bounds__(32, 1) void linear_nvfp4_rkv_orig_row1_blk16_f16_ke
   for (int j = 0; j < OutTile; ++j) {
     acc[j] = 0.0f;
   }
-  for (int kb = threadIdx.x; kb < KB; kb += 32) {
-    const int k = kb << 4;
-    // Load x as 8 __half2 values (16 elements)
-    const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
-    const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
-    const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
+
+  // Dual-block: process kb and kb+KB/2 per iteration
+  const int half_KB = KB >> 1;
+  for (int kb = threadIdx.x; kb < half_KB; kb += 32) {
+    // ── Block A: kb ──
+    const int kA = kb << 4;
+    const __half2* xA = reinterpret_cast<const __half2*>(x + kA);
+    const __half2 xA0 = xA[0], xA1 = xA[1], xA2 = xA[2], xA3 = xA[3];
+    const __half2 xA4 = xA[4], xA5 = xA[5], xA6 = xA[6], xA7 = xA[7];
+
+    // ── Block B: kb + half_KB ──
+    const int kB = (kb + half_KB) << 4;
+    const __half2* xB = reinterpret_cast<const __half2*>(x + kB);
+    const __half2 xB0 = xB[0], xB1 = xB[1], xB2 = xB[2], xB3 = xB[3];
+    const __half2 xB4 = xB[4], xB5 = xB[5], xB6 = xB[6], xB7 = xB[7];
+
 #pragma unroll
     for (int j = 0; j < OutTile; ++j) {
-      const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
-      const uint2 packed = *reinterpret_cast<const uint2*>(
+      // Block A
+      const float bsA = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+      const uint2 pkA = *reinterpret_cast<const uint2*>(
           w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
-      // Decode 16 weights as 8 __half2 pairs via LUT
-      const __half2 wv0 = byte_lut[packed.x & 0xFF];
-      const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
-      const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
-      const __half2 wv3 = byte_lut[packed.x >> 24];
-      const __half2 wv4 = byte_lut[packed.y & 0xFF];
-      const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
-      const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
-      const __half2 wv7 = byte_lut[packed.y >> 24];
-      // FP16 block accumulation: 8 __hfma2 = 16 FMA in 8 instructions
-      __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
-      acc_h = __hfma2(wv1, xv1, acc_h);
-      acc_h = __hfma2(wv2, xv2, acc_h);
-      acc_h = __hfma2(wv3, xv3, acc_h);
-      acc_h = __hfma2(wv4, xv4, acc_h);
-      acc_h = __hfma2(wv5, xv5, acc_h);
-      acc_h = __hfma2(wv6, xv6, acc_h);
-      acc_h = __hfma2(wv7, xv7, acc_h);
-      // Convert block sum to FP32 and apply block scale
-      const float2 bs_sum = __half22float2(acc_h);
-      acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
+      const __half2 wA0 = byte_lut[pkA.x & 0xFF];
+      const __half2 wA1 = byte_lut[(pkA.x >> 8) & 0xFF];
+      const __half2 wA2 = byte_lut[(pkA.x >> 16) & 0xFF];
+      const __half2 wA3 = byte_lut[pkA.x >> 24];
+      const __half2 wA4 = byte_lut[pkA.y & 0xFF];
+      const __half2 wA5 = byte_lut[(pkA.y >> 8) & 0xFF];
+      const __half2 wA6 = byte_lut[(pkA.y >> 16) & 0xFF];
+      const __half2 wA7 = byte_lut[pkA.y >> 24];
+      __half2 accA = __hfma2(wA0, xA0, __float2half2_rn(0.0f));
+      accA = __hfma2(wA1, xA1, accA);
+      accA = __hfma2(wA2, xA2, accA);
+      accA = __hfma2(wA3, xA3, accA);
+      accA = __hfma2(wA4, xA4, accA);
+      accA = __hfma2(wA5, xA5, accA);
+      accA = __hfma2(wA6, xA6, accA);
+      accA = __hfma2(wA7, xA7, accA);
+
+      // Block B (independent chain)
+      const float bsB = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb + half_KB]) * t_scale;
+      const uint2 pkB = *reinterpret_cast<const uint2*>(
+          w_nf4 + static_cast<int64_t>(n0 + j) * K2 + ((kb + half_KB) << 3));
+      const __half2 wB0 = byte_lut[pkB.x & 0xFF];
+      const __half2 wB1 = byte_lut[(pkB.x >> 8) & 0xFF];
+      const __half2 wB2 = byte_lut[(pkB.x >> 16) & 0xFF];
+      const __half2 wB3 = byte_lut[pkB.x >> 24];
+      const __half2 wB4 = byte_lut[pkB.y & 0xFF];
+      const __half2 wB5 = byte_lut[(pkB.y >> 8) & 0xFF];
+      const __half2 wB6 = byte_lut[(pkB.y >> 16) & 0xFF];
+      const __half2 wB7 = byte_lut[pkB.y >> 24];
+      __half2 accB = __hfma2(wB0, xB0, __float2half2_rn(0.0f));
+      accB = __hfma2(wB1, xB1, accB);
+      accB = __hfma2(wB2, xB2, accB);
+      accB = __hfma2(wB3, xB3, accB);
+      accB = __hfma2(wB4, xB4, accB);
+      accB = __hfma2(wB5, xB5, accB);
+      accB = __hfma2(wB6, xB6, accB);
+      accB = __hfma2(wB7, xB7, accB);
+
+      // Merge A+B into FP32 accumulator
+      const float2 sumA = __half22float2(accA);
+      const float2 sumB = __half22float2(accB);
+      acc[j] = fmaf(sumA.x + sumA.y, bsA, acc[j]);
+      acc[j] = fmaf(sumB.x + sumB.y, bsB, acc[j]);
+    }
+  }
+  // Handle odd KB
+  if (KB & 1) {
+    const int kb = threadIdx.x + half_KB * 2;
+    if (kb < KB) {
+      const int k = kb << 4;
+      const __half2* x2 = reinterpret_cast<const __half2*>(x + k);
+      const __half2 xv0 = x2[0], xv1 = x2[1], xv2 = x2[2], xv3 = x2[3];
+      const __half2 xv4 = x2[4], xv5 = x2[5], xv6 = x2[6], xv7 = x2[7];
+#pragma unroll
+      for (int j = 0; j < OutTile; ++j) {
+        const float bs = float(b_scale[static_cast<int64_t>(n0 + j) * KB + kb]) * t_scale;
+        const uint2 packed = *reinterpret_cast<const uint2*>(
+            w_nf4 + static_cast<int64_t>(n0 + j) * K2 + (kb << 3));
+        const __half2 wv0 = byte_lut[packed.x & 0xFF];
+        const __half2 wv1 = byte_lut[(packed.x >> 8) & 0xFF];
+        const __half2 wv2 = byte_lut[(packed.x >> 16) & 0xFF];
+        const __half2 wv3 = byte_lut[packed.x >> 24];
+        const __half2 wv4 = byte_lut[packed.y & 0xFF];
+        const __half2 wv5 = byte_lut[(packed.y >> 8) & 0xFF];
+        const __half2 wv6 = byte_lut[(packed.y >> 16) & 0xFF];
+        const __half2 wv7 = byte_lut[packed.y >> 24];
+        __half2 acc_h = __hfma2(wv0, xv0, __float2half2_rn(0.0f));
+        acc_h = __hfma2(wv1, xv1, acc_h);
+        acc_h = __hfma2(wv2, xv2, acc_h);
+        acc_h = __hfma2(wv3, xv3, acc_h);
+        acc_h = __hfma2(wv4, xv4, acc_h);
+        acc_h = __hfma2(wv5, xv5, acc_h);
+        acc_h = __hfma2(wv6, xv6, acc_h);
+        acc_h = __hfma2(wv7, xv7, acc_h);
+        const float2 bs_sum = __half22float2(acc_h);
+        acc[j] = fmaf(bs_sum.x + bs_sum.y, bs, acc[j]);
+      }
     }
   }
 #pragma unroll
@@ -1392,6 +1525,8 @@ at::Tensor linear_nvfp4_orig_row1_blk16_f16_cuda(
     at::Tensor x, at::Tensor w_nf4, at::Tensor b_scale, double t_scale, int64_t out_tile) {
   if (out_tile == 1) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<1>(x, w_nf4, b_scale, t_scale);
   if (out_tile == 2) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<2>(x, w_nf4, b_scale, t_scale);
+  if (out_tile == 4) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<4>(x, w_nf4, b_scale, t_scale);
+  if (out_tile == 8) return linear_nvfp4_orig_row1_blk16_f16_cuda_impl<8>(x, w_nf4, b_scale, t_scale);
   TORCH_CHECK(false, "unsupported linear_nvfp4_orig_row1_blk16 out_tile");
 }
 
@@ -1403,6 +1538,8 @@ at::Tensor linear_nvfp4_rkv_orig_row1_blk16_f16_cuda(
     double ts_r, double ts_k, double ts_v, int64_t out_tile) {
   if (out_tile == 1) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<1>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
   if (out_tile == 2) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<2>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  if (out_tile == 4) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<4>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
+  if (out_tile == 8) return linear_nvfp4_rkv_orig_row1_blk16_f16_cuda_impl<8>(x_r, x_k, x_v, w_r, w_k, w_v, bs_r, bs_k, bs_v, ts_r, ts_k, ts_v);
   TORCH_CHECK(false, "unsupported linear_nvfp4_rkv_orig_row1_blk16 out_tile");
 }
 
