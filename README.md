@@ -1,6 +1,6 @@
 # Albatross : efficient RWKV inference engine
 
-UPDATE: faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32), on single 5090.
+UPDATE: faster3b_2606 for MegaKernel B1T1 7B experiment (faster).
 
 UPDATE: faster3a_2605 (currently fastest) is up to 40% faster than faster3_2605 for small B/T (for better performance, tune linear_orig_layout for your GPU).
 ```
@@ -28,6 +28,8 @@ RESULT B=16 T=16 iters=3 p10_ms=14.8019 p50_ms=14.8049 p90_ms=14.8631 tok_s_p50=
 ```
 
 UPDATE: faster4_2605_cpp (faster for some BnTn, slower for some BnTn) as standalone (no libtorch, no python) C++ inference (for better performance, tune linear_orig_layout_launch for your GPU)
+
+UPDATE: faster3_2605 can reach 17000+ tps prefill (B1T1024), 15000+ tps decode (B1024T1), 21000+ tps batch prefill (B32T32), on single 5090.
 
 ---
 
