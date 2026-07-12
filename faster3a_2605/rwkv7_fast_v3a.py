@@ -324,6 +324,7 @@ class RWKV7:
         self.z = z
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._graph_cache: dict[tuple[int, int], dict] = {}
         # NVFP4: build block scale + tensor scale lookup tables (weight id -> scale)
         self.nf4_block_scales: dict[int, torch.Tensor] = {}
         self.nf4_t_scales: dict[int, float] = {}
@@ -385,6 +386,70 @@ class RWKV7:
         return dev
 
     def forward_from_x(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
+        """Forward pass with automatic CUDA Graph caching for repeated (B,T) shapes.
+
+        On first call for a given (B,T), performs warmup + graph capture.
+        Subsequent calls copy input into static buffer and replay the graph.
+        State tensors are updated in-place by the graph replay.
+
+        Disable with CUDA_GRAPH_AUTO=0. State must be the same tensor objects
+        across calls for a given (B,T) — create once with zero_state() and reuse.
+        """
+        B, T, _ = x.shape
+        use_graph = (
+            os.environ.get("CUDA_GRAPH_AUTO", "1") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+            and not all_logits
+            and not pp_enabled()
+            and last_indices is None
+        )
+        if not use_graph:
+            return self._forward_from_x_impl(x, state, path, all_logits, last_indices)
+
+        key = (B, T)
+        cached = self._graph_cache.get(key)
+        if cached is None:
+            log(f"CUDA Graph: capturing B={B} T={T}")
+            static_x = x.clone()
+            # Warmup with throwaway state so user's state is untouched
+            warmup_state = self.zero_state(B)
+            for _ in range(2):
+                self._forward_from_x_impl(static_x, warmup_state, path, False, None)
+            torch.cuda.synchronize()
+            # Capture on side stream (same pattern as bench_case)
+            # Must warmup on capture stream before graph capture
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self._forward_from_x_impl(static_x, warmup_state, path, False, None)
+            torch.cuda.current_stream().wait_stream(stream)
+            # Save state before capture — capture will advance it, we must undo
+            state_backup = [s.clone() for s in state]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                static_out = self._forward_from_x_impl(static_x, state, path, False, None)
+            torch.cuda.current_stream().wait_stream(stream)
+            # Restore state to pre-capture values (undo capture's 1-step advance)
+            for s, backup in zip(state, state_backup):
+                s.copy_(backup)
+            self._graph_cache[key] = {
+                "graph": graph,
+                "static_x": static_x,
+                "static_out": static_out,
+            }
+            log(f"CUDA Graph: captured B={B} T={T}")
+            # Replay to get correct output (capture output is unreliable)
+            # This advances state by exactly 1 step — the expected behavior
+            static_x.copy_(x)
+            graph.replay()
+            return static_out.clone()
+
+        # Replay: copy input, replay graph, clone output
+        cached["static_x"].copy_(x)
+        cached["graph"].replay()
+        return cached["static_out"].clone()
+
+    def _forward_from_x_impl(self, x: torch.Tensor, state: list[torch.Tensor], path: PathConfig, all_logits: bool = False, last_indices=None) -> torch.Tensor:
         if pp_enabled():
             return self.forward_from_x_pp(x, state, path, all_logits, last_indices)
         z = self.z
@@ -589,8 +654,19 @@ class RWKV7:
             w = self.linear_rank_out_act(w1, z.get(p+"w2"), z.get(p+"w2.t"), path.rows, 1)
             a = self.linear_rank_out(a1, z.get(p+"a2"), z.get(p+"a2.t"), path.rows)
             g = self.linear_rank_out_act(g1, z.get(p+"g2"), z.get(p+"g2.t"), path.rows, 2)
-        use_kkag_fuse = os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2
-        if not use_kkag_fuse:
+        # Determine dispatch mode once (avoids duplicate condition checks)
+        if T == 1 and WKV_MODE == "fp16" and B <= int(os.environ.get("FUSE_MAX_B", "2")):
+            if os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1":
+                dispatch_mode = "kkag"
+            elif os.environ.get("WKV_LNX_FUSE", "1") == "1":
+                dispatch_mode = "lnx"
+            else:
+                dispatch_mode = "sep"
+        else:
+            dispatch_mode = "sep"
+
+        neg_kk = kka = None
+        if dispatch_mode != "kkag":
             k, neg_kk, kka = ops.tmix_kk_a_gate(B, T, C, H, k.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"])
 
         if layer == 0:
@@ -606,9 +682,9 @@ class RWKV7:
 
         y_wkv = torch.empty_like(r)
         y = torch.empty_like(r)
-        if os.environ.get("KKAG_WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
+        if dispatch_mode == "kkag":
             torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_kkag_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), z[p+"k_k"], z[p+"a0"], a.contiguous(), z[p+"k_a"], y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
-        elif os.environ.get("WKV_LNX_FUSE", "1") == "1" and T == 1 and WKV_MODE == "fp16" and B <= 2:
+        elif dispatch_mode == "lnx":
             torch.ops.rwkv7_wkv_fp16_v2.wkv_lnx_seq_w0(B, T, C, H, wkv_state, r.contiguous(), w.contiguous(), z[p+"w0"], k.contiguous(), v.contiguous(), neg_kk.contiguous(), kka.contiguous(), y_wkv, elapsed_t, z[p+"r_k"], z[p+"ln_x.weight"], z[p+"ln_x.bias"], g.contiguous(), y)
         else:
             if WKV_MODE == "fp32io16":
@@ -1005,6 +1081,9 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     def percentile(values: list[float], q: float) -> float:
         return float(torch.quantile(torch.tensor(values, dtype=torch.float64), q / 100.0).item())
 
+    # bench_case does its own graph capture — disable auto-graph to avoid conflict
+    old_graph_auto = os.environ.get("CUDA_GRAPH_AUTO", "1")
+    os.environ["CUDA_GRAPH_AUTO"] = "0"
     state = model.zero_state(B)
     token_device = "cpu" if model.emb_cpu else first_device()
     tokens = torch.arange(B*T, dtype=torch.long, device=token_device).view(B,T)
@@ -1087,6 +1166,7 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
         tok_s = B*T*1000.0 / p50
         print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
         print(f"csv,rwkv7_fast_v3a_pp,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+        os.environ["CUDA_GRAPH_AUTO"] = old_graph_auto
         return
 
     graph = torch.cuda.CUDAGraph()
@@ -1125,6 +1205,7 @@ def bench_case(model: RWKV7, B: int, T: int, warmup: int, iters: int, profile_ra
     tok_s = B*T*1000.0 / p50
     print(f"RESULT B={B} T={T} iters={iters} p10_ms={p10:.4f} p50_ms={p50:.4f} p90_ms={p90:.4f} tok_s_p50={tok_s:.2f}", flush=True)
     print(f"csv,rwkv7_fast_v3a,{B},{T},{iters},{p10:.6f},{p50:.6f},{p90:.6f},{tok_s:.6f}", flush=True)
+    os.environ["CUDA_GRAPH_AUTO"] = old_graph_auto
 
 def run_eval(model: RWKV7, eval_json: str, eval_out: str, logits_out: str, paths: str) -> None:
     with open(eval_json, "r", encoding="utf-8") as f:

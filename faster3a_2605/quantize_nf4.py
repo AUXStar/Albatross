@@ -171,8 +171,15 @@ def quantize_model(input_path: str, output_path: str, verify: bool = False) -> N
     """量化模型并保存。"""
     t0 = time.perf_counter()
     print(f"[quantize] loading {input_path}")
-    # mmap=True: 低内存加载，但输出文件会膨胀，需要后续 repack
-    src = torch.load(input_path, map_location="cpu", mmap=True)
+    # Try mmap first (low memory), fall back to direct load (needs more RAM)
+    try:
+        src = torch.load(input_path, map_location="cpu", mmap=True)
+    except RuntimeError as e:
+        if "mmap" in str(e) or "Cannot allocate memory" in str(e):
+            print(f"[quantize] mmap failed ({e}), falling back to direct load")
+            src = torch.load(input_path, map_location="cpu")
+        else:
+            raise
     print(f"[quantize] loaded {len(src)} tensors in {time.perf_counter() - t0:.1f}s")
 
     quantized_count = 0
