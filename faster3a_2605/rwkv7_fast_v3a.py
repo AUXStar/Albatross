@@ -325,6 +325,47 @@ class RWKV7:
         self.emb_cpu = EMB_DEVICE == "cpu"
         self.emb_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         self._graph_cache: dict[tuple[int, int], dict] = {}
+        # NVFP4 fix: transpose-requant ffn.value.weight for cmix kernel layout
+        # Root cause: NVFP4 cmix kernel expects [F, C/2] layout
+        # (w_nf4[actual_f * C2 + col2]), but NVFP4 weights are excluded from
+        # transpose in preprocessing, keeping [C, F/2] layout.
+        # Fix: dequant [C, F/2] -> FP16 [F, C] (transpose=True) -> requant
+        # to NVFP4 [F, C/2] with new scales. Preserves NVFP4 format and VRAM.
+        _E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=first_device())
+        _requant_count = 0
+        for _vw_key in list(z.keys()):
+            if _vw_key.endswith(".ffn.value.weight") and z[_vw_key].dtype == torch.uint8:
+                _bs_key = _vw_key + ".nf4_b_scale"
+                _ts_key = _vw_key + ".nvfp4_t_scale"
+                if _bs_key in z and _ts_key in z:
+                    _bs = z[_bs_key]
+                    _ts = z[_ts_key].item()
+                    # Dequant with transpose=True -> [F, C] FP16
+                    _w_fc = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(z[_vw_key], _bs, _ts, True)
+                    # Re-quantize: [F, C] -> NVFP4 [F, C/2] + b_scale + t_scale
+                    _N, _K = _w_fc.shape
+                    _wf = _w_fc.float()
+                    _blocks = _wf.reshape(_N, _K // 16, 16)
+                    _max_abs = _blocks.abs().amax(dim=-1, keepdim=True)
+                    _max_abs = torch.clamp(_max_abs, min=1e-10)
+                    _bs_fp32 = (_max_abs / 6.0).squeeze(-1)
+                    _ts_new = max(_bs_fp32.max().item(), 1e-10)
+                    _bs_norm = _bs_fp32 / _ts_new
+                    _bs_new = _bs_norm.to(torch.float8_e4m3fn)
+                    _norm = _blocks / _max_abs
+                    _scaled = _norm * 6.0
+                    _sign = (_scaled < 0).to(torch.uint8)
+                    _idx = torch.bucketize(_scaled.abs(), _E2M1_BOUNDS)
+                    _codes = _idx.to(torch.uint8) | (_sign << 3)
+                    _codes = _codes.reshape(_N, _K)
+                    _packed = _codes[:, 0::2] | (_codes[:, 1::2] << 4)
+                    z[_vw_key] = _packed.to(torch.uint8).contiguous()
+                    z[_bs_key] = _bs_new.contiguous()
+                    z[_ts_key] = torch.tensor(_ts_new, dtype=torch.float32, device=_w_fc.device)
+                    _requant_count += 1
+        if _requant_count:
+            log(f"NVFP4 transpose-requant: {_requant_count} ffn.value.weight tensors re-quantized to [F, C/2]")
+
         # NVFP4: build block scale + tensor scale lookup tables (weight id -> scale)
         self.nf4_block_scales: dict[int, torch.Tensor] = {}
         self.nf4_t_scales: dict[int, float] = {}
@@ -439,7 +480,7 @@ class RWKV7:
             }
             log(f"CUDA Graph: captured B={B} T={T}")
             # Replay to get correct output (capture output is unreliable)
-            # This advances state by exactly 1 step — the expected behavior
+            # This advances state by exactly 1 step — the expected behavio
             static_x.copy_(x)
             graph.replay()
             return static_out.clone()
@@ -741,7 +782,12 @@ class RWKV7:
                     return nf4_ops.cmix_sparse_down_relu_rows_t512_nf4(hid.contiguous(), vw, b_scale, t_scale, B, T, C, F)
                 return nf4_ops.cmix_sparse_down_relu_rows_nf4(hid.contiguous(), vw, b_scale, t_scale, B, T, C, F)
             # dense path: dequant + cuBLAS
+            # NVFP4 value.weight was transpose-requanted to [F, C/2],
+            # so dequant with transpose=False to get [F, C] (not [C, F])
             k = ops.relu_square(hid.contiguous())
+            _bs = self.nf4_block_scales[id(vw)]
+            _ts = self.nf4_t_scales[id(vw)]
+            vw = torch.ops.rwkv7_nf4_ops.dequant_nf4_to_f16(vw, _bs, _ts, False)
             return self.linear(k, vw)
         # FP16 value.weight: original path
         if path.cmix_mode == CMIX_B1T1_NOFC:
